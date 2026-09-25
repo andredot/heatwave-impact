@@ -16,7 +16,7 @@ cfg <- list(
   cache_dir  = "data/cache",
   # 491 MB file with 1000 coefficient draws that keep the correlation between
   # age groups. FALSE = draw from vcov.csv (age groups independent).
-  use_coef_simu = TRUE,
+  use_coef_simu = FALSE,
 
   # ---- city definition (Urban Audit city -> Istat comuni) -------------------
   urau_year     = 2021,   # release used to label the crosswalk
@@ -88,7 +88,41 @@ cfg <- list(
   forecast_start    = as.Date("2024-01-01"),
   forecast_leads    = 1:7,
   forecast_timezone = "GMT",
-  fc_debias         = TRUE,  # remove city x month x lead mean error (non-episode days)
+  fc_debias         = FALSE,  # TRUE: subtract each city x month x lead mean forecast
+                              # error (estimated outside the episodes being scored)
+
+  # ---- influenza activity (input to FluMOMO) --------------------------------
+  influenza = list(
+    country = "Italy", country_code = "ITA",
+    file = "data/raw/influenza_activity_IT.csv",   # built by the pipeline
+    flunet_file = "data/raw/flunet_italy.csv",     # optional manual FluNet export
+    use_existing = FALSE,  # TRUE: keep the file at `file` as it is, download nothing
+    allow_zero = FALSE     # TRUE: run FluMOMO with IA = 0 if nothing can be obtained
+  ),
+
+  # ---- regional excess mortality with the official FluMOMO code -------------
+  flumomo = list(
+    region = "Lombardia", country_code = "IT-LOM",
+    code_dir = "R/flumomo",
+    work_dir = "flumomo_run",
+    years = 2015:2026, agegrp = 4L, # 4 = total, 3 = 65+
+    ia_lags = 2, et_lags = 2, ia_restricted = TRUE,
+    chart_year = 2026,
+    provinces = data.frame(
+      NUTS3 = c("ITC4C", "ITC47", "ITC46", "ITC4D", "ITC42", "ITC41",
+                "ITC48", "ITC4B", "ITC4A", "ITC43", "ITC49", "ITC44"),
+      name = c("Milano", "Brescia", "Bergamo", "Monza e Brianza", "Como", "Varese",
+               "Pavia", "Mantova", "Cremona", "Lecco", "Lodi", "Sondrio"),
+      prov = c("015", "017", "016", "108", "013", "012",
+               "018", "020", "019", "097", "098", "014"),
+      lat = c(45.4642, 45.5416, 45.6983, 45.5845, 45.8081, 45.8206,
+              45.1847, 45.1564, 45.1332, 45.8566, 45.3140, 46.1700),
+      lon = c(9.1900, 10.2118, 9.6773, 9.2744, 9.0852, 8.8251,
+              9.1582, 10.7914, 10.0227, 9.3977, 9.5030, 9.8700),
+      pop3 = c(3220000, 1260000, 1110000, 875000, 600000, 880000,
+               540000, 410000, 355000, 335000, 230000, 180000),
+      stringsAsFactors = FALSE)
+  ),
 
   seed = 20260922
 )

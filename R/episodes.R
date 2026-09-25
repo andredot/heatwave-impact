@@ -231,8 +231,11 @@ fit_counterfactual <- function(mort, expo, episodes, erf, start, end, cfg) {
                     v = v + phi * sum(bp$point[w] * rr),
                     attr_app = attr_app + sum(((1 - 1 / rr) * bd_app)[pl$logrr[w] > 0]))]
       }
+      # log-scale spread of the baseline, kept so the app can show intervals
+      b_logsd <- apply(log(pmax(bp$draws, 1e-9)), 2, stats::sd)
       daily[[length(daily) + 1]] <- d[, .(URAU_CODE = cd, agegroup = g, date, deaths = y, tmean,
-                                          B = bp$point, logrr = pl$logrr, mmt = pl$mmt, ref)]
+                                          B = bp$point, B_logsd = b_logsd,
+                                          logrr = pl$logrr, mmt = pl$mmt, ref)]
     }
     win_rows[[length(win_rows) + 1]] <- cbind(wins, acc)
     dP[[length(dP) + 1]] <- P_d; dE[[length(dE) + 1]] <- E_d

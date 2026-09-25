@@ -11,7 +11,9 @@ library(targets)
 library(tarchetypes)
 
 source("R//config.R")
-tar_source("R")
+# Only this project's own files: a vendored copy of the official FluMOMO code
+# under R/ must not be sourced (it expects variables set by its own launcher).
+tar_source(files = list.files("R", pattern = "[.][Rr]$", full.names = TRUE))
 
 tar_option_set(
   packages = c("data.table", "dlnm", "splines", "mixmeta", "sf", "jsonlite"),
@@ -94,12 +96,36 @@ list(
   tar_target(example, example_series(counterfactual, recal_curves, erf, cities, config)),
   tar_target(fc_impact, forecast_episode_impact(counterfactual, cf_eval, forecasts,
                                                 era5_test, exposure_check, erf, config)),
+
+  # ---- regional excess mortality (official FluMOMO code) --------------------
+  tar_target(influenza_file, build_influenza_activity(config), format = "file"),
+  tar_target(flumomo_weather, build_flumomo_weather(
+    config, as.Date(sprintf("%d-01-01", min(config$flumomo$years))),
+    min(data_end, Sys.Date() - 7)), format = "file"),
+  tar_target(flumomo_results, run_region_flumomo(config, istat_file, flumomo_weather,
+                                                 influenza_file)),
+  tar_target(flumomo_chart, plot_region_excess(flumomo_results, istat_file, config),
+             format = "file"),
+  # same code, restricted to the comuni of the validated cities of the region,
+  # so its baseline can replace ours in test B
+  tar_target(region_cities, crosswalk$map[substr(PRO_COM, 1, 3) %in%
+                                            config$flumomo$provinces$prov]),
+  tar_target(flumomo_cities, run_region_flumomo(config, istat_file, flumomo_weather,
+                                                influenza_file,
+                                                procom = unique(region_cities$PRO_COM),
+                                                label = "cities")),
+  tar_target(flumomo_sensitivity, flumomo_test_b(
+    flumomo_cities, counterfactual, recal_curves, erf, istat_file,
+    unique(region_cities$PRO_COM), unique(region_cities$URAU_CODE), config)),
+
   # ---- data bundle for the Shiny app ----------------------------------------
   tar_target(app_data, export_app_bundle(counterfactual, recal_curves, erf, cities,
                                          crosswalk, gisco_files, exposure_check,
                                          forecasts, era5_test, data_end, config,
-                                         "reports/app_data.rds"),
+                                         "app/app_data.rds",
+                                         flumomo_results, flumomo_cities, istat_file),
              format = "file"),
+
   # ---- report ---------------------------------------------------------------
   tar_quarto(report, "reports//validation_report.qmd")
 )

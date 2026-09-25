@@ -1,3 +1,23 @@
+#' Weekly FluMOMO series for selected age groups
+#'
+#' Keeps the columns the app needs: the baseline, the baseline plus the
+#' influenza contribution (the expected series without extreme temperature),
+#' and the deaths FluMOMO attributes to extreme temperature.
+#'
+#' @param res Output of [run_region_flumomo()], or `NULL`.
+#' @param agegrps Age groups to sum.
+#' @return data.table, or `NULL`.
+flumomo_weekly <- function(res, agegrps) {
+  if (is.null(res) || !nrow(res)) return(NULL)
+  r <- as.data.frame(res)
+  r <- r[r$agegrp %in% agegrps & !is.na(r$year) & !is.na(r$week), ]
+  d <- data.table::as.data.table(r)[, .(deaths = sum(deaths), EB = sum(EB),
+                                        expected = sum(EB + EdIA), EdET = sum(EdET)),
+                                    by = .(year, week)]
+  d[, week_start := ISOweek::ISOweek2date(sprintf("%d-W%02d-1", year, week))]
+  d[order(week_start)]
+}
+
 #' Build the data bundle used by the Shiny app
 #'
 #' Everything the app needs, computed once by the pipeline so that the app
@@ -21,7 +41,9 @@
 #' @param path Destination `.rds`.
 #' @return `path`.
 export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
-                              fc, era5, data_end, cfg, path = "app/app_data.rds") {
+                              fc, era5, data_end, cfg, path = "app/app_data.rds",
+                              flumomo_region = NULL, flumomo_cities = NULL,
+                              istat_file = NULL) {
   ensure_dir(dirname(path))
   codes <- sort(unique(cf$daily$URAU_CODE))
   ct <- cities[URAU_CODE %in% codes]
@@ -69,12 +91,12 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
     sp <- erf_spec(erf, cd, cfg)
     pub <- lapply(stats::setNames(AGE_GROUPS, AGE_GROUPS), function(g) {
       b <- erf_coef(erf, cd, g)
-      list(beta = b, mmt = erf_mmt(sp, b))
+      list(beta = b, vcov = erf_vcov(erf, cd, g), mmt = erf_mmt(sp, b))
     })
     rec <- list()
     for (rc in Filter(Negate(is.null), recals)) if (!is.null(rc$curves[[cd]])) {
       b <- rc$curves[[cd]]$beta
-      rec[[rc$label]] <- list(beta = b, mmt = erf_mmt(sp, b))
+      rec[[rc$label]] <- list(beta = b, vcov = rc$curves[[cd]]$vcov, mmt = erf_mmt(sp, b))
     }
     list(spec = list(knots = sp$knots, bound = sp$bound, degree = sp$degree,
                      p99 = sp$p99, pred_grid = sp$pred_grid, pred_pct = sp$pred_pct),
@@ -82,7 +104,9 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
   })
 
   # ---- daily deaths and baseline --------------------------------------------
-  daily <- cf$daily[, .(URAU_CODE, agegroup, date, deaths, B)]
+  daily <- cf$daily[, .(URAU_CODE, agegroup, date, deaths, B,
+                        B_logsd = if ("B_logsd" %in% names(cf$daily)) B_logsd else 0,
+                        tmean, logrr, mmt)]
   data.table::setkey(daily, URAU_CODE, date, agegroup)
 
   # ---- systematic forecast error, by city, month and lead -------------------
@@ -99,6 +123,17 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
     regions = simplify(nuts[, "region"], 1000),
     city_geom = if (!is.null(city_geom)) simplify(city_geom, 500) else NULL,
     curves = curves, daily = daily, delta = check$delta,
+    region = list(
+      name = cfg$flumomo$region,
+      cities = unique(crosswalk$map[substr(PRO_COM, 1, 3) %in% cfg$flumomo$provinces$prov,
+                                    URAU_CODE]),
+      daily = if (!is.null(istat_file))
+        istat_daily_area(istat_file, cfg$flumomo$provinces$prov, 0, cfg$flumomo$years)
+      else NULL),
+    flumomo = list(
+      region = flumomo_weekly(flumomo_region, c(2L, 3L)),
+      cities = flumomo_weekly(flumomo_cities, c(2L, 3L)),
+      region_all = flumomo_weekly(flumomo_region, 4L)),
     data_end = data_end, era5_timezone = cfg$era5_timezone,
     bias_correct = isTRUE(cfg$bias_correct),
     built = Sys.Date())

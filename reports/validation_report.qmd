@@ -389,12 +389,24 @@ if (!is.null(bt)) {
 }
 ```
 
-The shapes agree; the levels do not. In almost every large city the refitted
-curve follows the published one along the cold side and up to the minimum,
-then rises less steeply above it. That is the signature of a curve whose heat
-arm is too steep rather than of a differently shaped relationship, and it is
-why the disagreement concentrates in exactly the days a heat warning system
-cares about.
+Heterogeneity between cities is small (I-squared of
+`r fmt(pt[group == "All cities", i2], 0)`% in the test period), so this is a
+common shift rather than a few outliers, and cities whose curves were fitted on
+their own mortality show much the same gap as cities where the curve was
+extrapolated from the meta-regression
+(`r fmt(pt[grepl("MCC", group) & !grepl("Difference", group), ratio], 2)` against
+`r fmt(pt[grepl("extrapolated", group) & !grepl("Difference", group), ratio], 2)`,
+difference not significant). The spatial prediction is therefore not the
+problem.
+
+The disagreement is confined to the heat arm. Above the minimum the refitted
+curve rises much less steeply than the published one in every large city, and
+the gap widens with temperature. Below the minimum the two run close together
+in most cities, while in several (Catania, Florence, Bari, Milan, Verona) the
+refitted cold arm sits somewhat above the published one, so this is not a
+curve that is flatter everywhere: it is a curve with a weaker heat effect.
+The cold side is not what these tests are about, and it is confounded by
+influenza, so no weight is put on it here.
 
 ```{r test-a-blup}
 if (!is.null(bt)) kbl(bt$results[, .(Cities = .N, `Median RR99 published` = fmt(median(rr99_pub), 3),
@@ -436,16 +448,6 @@ show_curve_test(cr, pr, periods$repro$label)
 ```{r test-a-repro-forest, fig.height=10}
 if (isTRUE(cfg$run_reproduction)) forest_plot(cr, pr, periods$repro$label)
 ```
-
-Heterogeneity between cities is small (I-squared of
-`r fmt(pt[group == "All cities", i2], 0)`% in the test period), so this is a
-common shift rather than a few outliers, and cities whose curves were fitted on
-their own mortality show much the same gap as cities where the curve was
-extrapolated from the meta-regression
-(`r fmt(pt[grepl("MCC", group) & !grepl("Difference", group), ratio], 2)` against
-`r fmt(pt[grepl("extrapolated", group) & !grepl("Difference", group), ratio], 2)`,
-difference not significant). The spatial prediction is therefore not the
-problem.
 
 ## Trend across time windows
 
@@ -678,6 +680,54 @@ if (!is.null(ex)) {
 }
 ```
 
+## Sensitivity: the FluMOMO baseline
+
+Test B measures observed heat deaths against our own baseline of deaths
+expected without heat. To check that the result does not depend on it, the
+same comparison is repeated against the baseline of the official EuroMOMO
+FluMOMO code, run on the comuni of the validated cities of
+`r tar_read(config)$flumomo$region` by a different method, at weekly
+resolution and for all ages. The expected series there is `EB + EdIA`, the
+FluMOMO baseline plus the deaths it attributes to influenza, so influenza
+stays out of the residual and what remains above it in the warm season is the
+heat signal. Only the warm-season weeks for which the curves produce a
+prediction are used, that is those of the test period: FluMOMO is fitted on a
+longer history, and earlier weeks would enter with a prediction of zero.
+
+```{r flumomo-sens}
+fs2 <- tryCatch(tar_read(flumomo_sensitivity), error = function(e) NULL)
+if (is.null(fs2)) {
+  cat("Not available: the FluMOMO targets have not been run",
+      "(the official code must be unzipped in the folder set in config.R).")
+} else {
+  kbl(fs2$calibration[, .(Curves = curves, `Summer weeks` = weeks,
+                          `Observed heat deaths` = fmt(observed, 0),
+                          `Predicted` = fmt(predicted, 0),
+                          `Observed / predicted` = fmt(ratio),
+                          Slope = sprintf("%s (%s-%s)", fmt(slope), fmt(lo), fmt(hi)),
+                          `FluMOMO extreme temperature` = fmt(flumomo_ET, 0))],
+      caption = sprintf(paste("Test B against the FluMOMO baseline, %d cities, %s to %s.",
+                              "The last column is what FluMOMO itself attributes to",
+                              "extreme temperature over the same weeks."),
+                        fs2$n_cities, fs2$period[1], fs2$period[2]))
+}
+```
+
+```{r flumomo-sens-plot, fig.height=4.5}
+if (!is.null(fs2)) {
+  w <- fs2$weekly[month %in% cfg$warm_months]
+  print(ggplot(w, aes(P, X, colour = curves)) +
+    geom_hline(yintercept = 0, colour = "grey80") +
+    geom_abline(colour = "grey40", linetype = 2) +
+    geom_point(alpha = .7) + geom_smooth(method = "lm", formula = y ~ 0 + x, se = FALSE) +
+    labs(x = "Predicted heat deaths in the week", y = "Observed above the FluMOMO baseline",
+         colour = NULL, title = "Weekly heat deaths against the FluMOMO baseline") +
+    theme(legend.position = "bottom"))
+}
+```
+
+`r if (!is.null(fs2)) "Two baselines built on different principles, at different resolutions, should not give identical numbers; what matters is whether they agree on the direction and the rough size of the gap." else ""`
+
 # Interpretation
 
 ```{r interpretation, results='asis'}
@@ -729,12 +779,33 @@ cat(sprintf(paste0(
 "as new years accumulate.\n\n"),
 fmt(ep$observed / ep$predicted), fmt(best$ratio), best$curves, fmt(best$slope)))
 
-cat(paste0(
-"**Displacement is part of the story.** In the two weeks after an episode the ",
-"published curves keep predicting excess deaths while the observed excess is ",
-"much smaller, so some of the deaths are being brought forward by days rather ",
-"than added. A cumulative 21-day curve carries this inside it, which is one ",
-"reason a curve fitted on longer series transfers better than a short one.\n\n"))
+cat(sprintf(paste0(
+"**Displacement is part of the story.** In the %d days after an episode the ",
+"published curves predict %s further deaths while %s are observed above the ",
+"baseline, so a large part of what the curves count is death brought forward ",
+"by days rather than added. A cumulative 21-day curve carries this inside it, ",
+"which is one reason a curve fitted on longer series transfers better than a ",
+"short one.\n\n"), cfg$post_days, fmt(ev$totals$post_predicted, 0),
+fmt(ev$totals$post_observed, 0)))
+
+if (!is.null(fs2)) {
+  fpub <- fs2$calibration[curves == "Published (Masselot et al.)"]
+  closer <- abs(log(pmax(fpub$flumomo_ET, 1) / fpub$predicted)) <
+    abs(log(pmax(fpub$observed, 1) / fpub$predicted))
+  cat(sprintf(paste0(
+  "**A second baseline.** Repeating the comparison against the baseline of the ",
+  "official FluMOMO code, on %d %s at weekly resolution, gives a slope of %s ",
+  "for the published curves (observed over predicted %s), against %s in the ",
+  "main test. FluMOMO itself attributes %s deaths to extreme temperature over ",
+  "those weeks, against %s predicted by the published curves, so %s\n\n"),
+  fs2$n_cities, ifelse(fs2$n_cities == 1, "city,", "cities,"),
+  fmt(fpub$slope), fmt(fpub$ratio), fmt(ep$slope), fmt(fpub$flumomo_ET, 0),
+  fmt(fpub$predicted, 0),
+  if (closer) paste("the two model-based estimates sit closer to each other than",
+                    "either does to the observed excess.")
+  else paste("the two model-based estimates differ from each other by as much as",
+             "the published curves differ from the observed excess.")))
+}
 
 cat(sprintf(paste0(
 "**What is not settled.** Part of the recent decline may not be adaptation: ",
