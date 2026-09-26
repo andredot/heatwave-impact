@@ -144,9 +144,14 @@ overlay_cities <- function(gisco, metadata, cfg) {
 #' @param istat Output of [read_istat()].
 #' @param erf Output of [read_erf_bundle()].
 #' @param cfg Configuration list.
+#' @param official Output of [official_city_map()], or `NULL`. When supplied
+#'   (and `cfg$city_source` is not `"geometry"`), the city composition comes
+#'   from the Eurostat correspondence table and the geometric candidates are
+#'   kept only for reference; the checks below are unchanged and now test the
+#'   official table.
 #' @return List with `map` (city-comune table used downstream), `checks`
 #'   (one row per city) and `candidates` (all candidate definitions).
-finalize_crosswalk <- function(overlay, istat, erf, cfg) {
+finalize_crosswalk <- function(overlay, istat, erf, cfg, official = NULL) {
   meta <- erf$metadata
   cand <- merge(overlay$candidates, meta[, .(URAU_CODE, meta_name = URAU_NAME,
                                              pop = as.numeric(pop))], by = "URAU_CODE")
@@ -161,10 +166,14 @@ finalize_crosswalk <- function(overlay, istat, erf, cfg) {
   cand[, chosen := seq_len(.N) == which.min(score), by = URAU_CODE]
   pick <- cand[chosen == TRUE]
 
-  map <- merge(pick[, .(URAU_CODE, level, poly_code)],
+  use_official <- !is.null(official) && nrow(official) &&
+    !identical(cfg$city_source, "geometry")
+  map <- if (use_official) data.table::copy(official) else {
+    m <- merge(pick[, .(URAU_CODE, level, poly_code)],
                overlay$members[share_lau >= cfg$lau_share_min],
                by = c("level", "poly_code"), allow.cartesian = TRUE)
-  map <- map[, .(URAU_CODE, level, PRO_COM, LAU_NAME, lau_pop)]
+    m[, .(URAU_CODE, level, PRO_COM, LAU_NAME, lau_pop)]
+  }
   if (nrow(ov[action %in% c("add", "remove")])) {
     ov[, PRO_COM := pad_procom(PRO_COM)]
     drop <- ov[action == "remove"]
@@ -194,6 +203,7 @@ finalize_crosswalk <- function(overlay, istat, erf, cfg) {
                chk, by = "URAU_CODE", all.x = TRUE)
   chk <- merge(chk, pick[, .(URAU_CODE, poly_code, poly_name, n_candidates = NA_integer_)],
                by = "URAU_CODE", all.x = TRUE)
+  if (use_official) chk[, poly_name := meta$URAU_NAME[match(URAU_CODE, meta$URAU_CODE)]]
   chk[, n_candidates := vapply(URAU_CODE, function(cd) sum(cand$URAU_CODE == cd), 0L)]
   chk[, istat_deaths_yr := vapply(URAU_CODE, function(cd)
     sum(ref$deaths[ref$PRO_COM %in% map$PRO_COM[map$URAU_CODE == cd]]) / max(nyr, 1), 0)]
@@ -219,5 +229,7 @@ finalize_crosswalk <- function(overlay, istat, erf, cfg) {
   chk[, analysed := !status %in% c("no polygon contains the city point",
                                    "codes missing in Istat", "wrong city definition")]
   list(map = map[URAU_CODE %in% chk[analysed == TRUE, URAU_CODE] & in_istat],
-       checks = chk[order(-pop)], candidates = cand[order(URAU_CODE, level)])
+       checks = chk[order(-pop)], candidates = cand[order(URAU_CODE, level)],
+       source = if (use_official) "Eurostat CITY-LAU correspondence table"
+                else "geometric matching (city point in GISCO polygons)")
 }

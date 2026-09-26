@@ -603,6 +603,35 @@ the largest observed excess is in
 observed to predicted in
 `r ev$by_year[type == "episode"][which.min(X / P), year]`.
 
+```{r test-b-ratio, fig.height=4.6}
+if (has_ep) {
+  cs_r <- tryCatch(tar_read(curve_sets)$windows, error = function(e) NULL)
+  rr <- rbind(
+    ev$windows[type %in% c("episode", "summer"),
+               .(type, P, X, v, curves = "Published (Masselot et al.)")],
+    if (!is.null(cs_r)) cs_r[, .(type, P, X, v, curves)] else NULL)
+  # the ratio is unstable when almost nothing is predicted
+  thr <- stats::quantile(rr$P[rr$P > 0], .5, na.rm = TRUE)
+  rr <- rr[P >= thr]
+  rr[, `:=`(ratio = X / P,
+            type = factor(type, c("episode", "summer"),
+                          c("Heatwave episodes", "Whole summers")))]
+  print(ggplot(rr, aes(P, ratio, colour = curves)) +
+    geom_hline(yintercept = 1, colour = "grey40", linetype = 2) +
+    geom_point(aes(size = 1 / pmax(v, 1)), alpha = .6) +
+    geom_smooth(method = "lm", formula = y ~ x, se = FALSE, linewidth = .8) +
+    facet_wrap(~ type, scales = "free_x") + scale_size(guide = "none") +
+    coord_cartesian(ylim = stats::quantile(rr$ratio, c(.02, .98), na.rm = TRUE)) +
+    labs(x = "Predicted heat deaths", y = "Observed / predicted", colour = NULL,
+         title = "Does the over-prediction grow with the size of the episode?",
+         subtitle = paste(strwrap(sprintf(paste(
+           "Windows with at least %s predicted deaths; 1 = calibrated.",
+           "A downward line means the largest episodes are the most over-predicted."),
+           fmt(thr, 0)), width = 95), collapse = "\n")) +
+    theme(legend.position = "bottom"))
+}
+```
+
 ```{r test-b-list}
 if (has_ep) {
   el <- merge(ev$windows[type == "episode"], tar_read(cities)[, .(URAU_CODE, name)],

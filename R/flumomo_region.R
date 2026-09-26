@@ -44,7 +44,7 @@ build_flumomo_weather <- function(cfg, from, to, path = NULL) {
 #' @param label Name used for the output files when `procom` is given.
 #' @return data.table of official results.
 run_region_flumomo <- function(cfg, istat_file, weather_file, influenza_file = NULL,
-                               procom = NULL, label = NULL) {
+                               procom = NULL, label = NULL, code = NULL) {
   fm <- cfg$flumomo
   deaths <- istat_weekly_euromomo(istat_file, fm$provinces$prov, fm$years, procom)
   weather <- data.table::fread(weather_file)[, date := as.Date(date)]
@@ -56,7 +56,8 @@ run_region_flumomo <- function(cfg, istat_file, weather_file, influenza_file = N
   region <- label %||% fm$region
   work <- ensure_dir(if (is.null(label)) fm$work_dir else paste0(fm$work_dir, "_", label))
   flumomo_write_inputs(work, deaths, weather, ia, fm$country_code)
-  flumomo_run(fm$code_dir, work, country = region, country_code = fm$country_code,
+  flumomo_run(if (is.null(code)) fm$code_dir else dirname(code), work,
+              country = region, country_code = fm$country_code,
               start = min(weather$date), end = max(weather$date),
               ia_lags = fm$ia_lags, et_lags = fm$et_lags,
               ia_restricted = fm$ia_restricted)

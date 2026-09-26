@@ -99,7 +99,8 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
       rec[[rc$label]] <- list(beta = b, vcov = rc$curves[[cd]]$vcov, mmt = erf_mmt(sp, b))
     }
     list(spec = list(knots = sp$knots, bound = sp$bound, degree = sp$degree,
-                     p99 = sp$p99, pred_grid = sp$pred_grid, pred_pct = sp$pred_pct),
+                     p99 = sp$p99, pred_grid = sp$pred_grid, pred_pct = sp$pred_pct,
+                     hw_threshold = pct_value(erf$tdist[URAU_CODE == cd], cfg$hw_pct)),
          published = pub, recalibrated = rec)
   })
 
@@ -114,7 +115,7 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
   # convex, that bias inflates predicted deaths. These offsets let the app
   # subtract it before converting temperatures into deaths.
   fc_bias <- merge(fc, era5, by = c("URAU_CODE", "date"))[
-    , .(bias = mean(tmean_fc - tmean_raw), n = .N),
+    , .(bias = mean(tmean_fc - tmean_raw), sd = stats::sd(tmean_fc - tmean_raw), n = .N),
     by = .(URAU_CODE, month = data.table::month(date), lead)][n >= 10]
 
   out <- list(

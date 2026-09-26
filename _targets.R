@@ -41,13 +41,18 @@ list(
   # ---- city definition ------------------------------------------------------
   tar_target(gisco_files, download_gisco(config), format = "file"),
   tar_target(overlay, overlay_cities(gisco_files, erf$metadata, config)),
+  tar_target(city_table, read_city_lau_table(config)),
+  tar_target(city_map, official_city_map(
+    city_table, erf$metadata,
+    unique(overlay$members[, .(PRO_COM, lau_pop)]))),
 
   # ---- mortality ------------------------------------------------------------
-  tar_target(istat_file, config$istat_csv, format = "file"),
-  tar_target(istat, read_istat(istat_file, unique(overlay$members$PRO_COM))),
+  tar_target(istat_file, download_istat(config), format = "file"),
+  tar_target(istat, read_istat(istat_file,
+                               unique(c(overlay$members$PRO_COM, city_map$PRO_COM)))),
   tar_target(data_end, detect_data_end(istat, config$data_end)),
   tar_target(periods, make_periods(config, data_end)),
-  tar_target(crosswalk, finalize_crosswalk(overlay, istat, erf, config)),
+  tar_target(crosswalk, finalize_crosswalk(overlay, istat, erf, config, city_map)),
   tar_target(mort, aggregate_mortality(istat, crosswalk$map,
                                        min(config$repro_start, config$test_start), data_end)),
   tar_target(cities, erf$metadata[URAU_CODE %in% crosswalk$map$URAU_CODE,
@@ -99,6 +104,7 @@ list(
 
   # ---- regional excess mortality (official FluMOMO code) --------------------
   tar_target(influenza_file, build_influenza_activity(config), format = "file"),
+  tar_target(flumomo_code, download_flumomo(config), format = "file"),
   tar_target(flumomo_weather, build_flumomo_weather(
     config, as.Date(sprintf("%d-01-01", min(config$flumomo$years))),
     min(data_end, Sys.Date() - 7)), format = "file"),
@@ -113,7 +119,7 @@ list(
   tar_target(flumomo_cities, run_region_flumomo(config, istat_file, flumomo_weather,
                                                 influenza_file,
                                                 procom = unique(region_cities$PRO_COM),
-                                                label = "cities")),
+                                                label = "cities", code = flumomo_code)),
   tar_target(flumomo_sensitivity, flumomo_test_b(
     flumomo_cities, counterfactual, recal_curves, erf, istat_file,
     unique(region_cities$PRO_COM), unique(region_cities$URAU_CODE), config)),

@@ -55,6 +55,7 @@ PUB <- "Pubblicate (Masselot 2023)"
 COL <- c("#B2182B", "#1B7837", "#762A83", "#B35806")
 
 it_label <- function(x) sub("^Italian curves", "Curve italiane", x)
+pct_fmt <- function(p) if (is.na(p)) "n.d." else sprintf("%.0f%%", 100 * p)
 
 # ---- utilita' numeriche -----------------------------------------------------
 basis <- function(t, spec) {
@@ -205,6 +206,87 @@ city_attributable <- function(code, temps, curve_name, nsim) {
        observed = base[, .(obs = sum(obs)), by = date][match(temps$date, date), obs])
 }
 
+# ---- scenari ----------------------------------------------------------------
+#' Probability that a heatwave starts within the horizon
+#'
+#' A day counts as hot when the temperature reaches the city's heatwave
+#' threshold (the percentile behind the episode definition). Forecast error is
+#' taken from the archive: for each lead, the spread of past errors turns the
+#' forecast into a probability. An episode is `hw_min` consecutive hot days;
+#' the probability of at least one such run starting in the window is computed
+#' assuming days are independent given the forecast, which understates
+#' persistence and is therefore conservative.
+#'
+#' @param temps data.table `date`, `tmean`, `lead` for one city.
+#' @param code Urban Audit code.
+#' @param hw_min Consecutive days required.
+#' @return List with `p_day` (per day) and `p_onset`.
+onset_probability <- function(temps, code, hw_min = 3) {
+  thr <- BUNDLE$curves[[code]]$spec$hw_threshold
+  if (is.null(thr) || !nrow(temps)) return(list(p_day = numeric(0), p_onset = NA_real_))
+  sdv <- rep(1.2, nrow(temps))
+  fb <- if (!is.null(BUNDLE$fc_bias)) as.data.table(BUNDLE$fc_bias)[URAU_CODE == code] else NULL
+  if (!is.null(fb) && nrow(fb) && "sd" %in% names(fb)) {
+    m <- month(temps$date)
+    lead_c <- pmin(pmax(temps$lead, min(fb$lead)), max(fb$lead))
+    key <- data.table(month = m, lead = lead_c)
+    got <- merge(key, fb[, .(month, lead, sd)], by = c("month", "lead"), all.x = TRUE,
+                 sort = FALSE)$sd
+    sdv <- ifelse(is.na(got), 1.2, got)
+  }
+  p <- stats::pnorm(temps$tmean, mean = thr, sd = pmax(sdv, .3))   # P(T >= threshold)
+  runs <- if (length(p) >= hw_min)
+    vapply(seq_len(length(p) - hw_min + 1), function(i) prod(p[i:(i + hw_min - 1)]), 0)
+  else 0
+  list(p_day = p, p_onset = 1 - prod(1 - runs))
+}
+
+#' Scenarios: the forecast window, then the episode continuing
+#'
+#' The forecast window is costed as it stands. Each further block of days
+#' assumes the heat continues at the level of the hottest forecast days, so the
+#' extra deaths are conditional on the episode lasting that long, not a
+#' prediction that it will.
+#'
+#' @param codes Cities.
+#' @param temps_by_city Named list of temperature tables.
+#' @param curve_name Curve set to use.
+#' @param blocks Lengths of the additional blocks, in days.
+#' @param nsim Draws.
+#' @return data.table with one row per scenario.
+scenario_table <- function(codes, temps_by_city, curve_name, blocks = c(5, 5), nsim = NSIM) {
+  acc <- NULL; add <- function(x, y) if (is.null(x)) y else x + y
+  point <- 0; draws <- 0
+  peak_point <- 0; peak_draws <- 0
+  for (cd in codes) {
+    tt <- temps_by_city[[cd]]
+    if (is.null(tt) || !nrow(tt)) next
+    a <- city_attributable(cd, tt, curve_name, nsim)
+    if (is.null(a)) next
+    point <- point + sum(a$point); draws <- add(draws, rowSums(a$draws))
+    # a further day at the level of the three hottest forecast days
+    hot <- tt[order(-tmean)][seq_len(min(3, .N))]
+    one <- data.table(date = max(tt$date) + 1, tmean = mean(hot$tmean), lead = max(tt$lead))
+    b <- city_attributable(cd, one, curve_name, nsim)
+    if (!is.null(b)) {
+      peak_point <- peak_point + sum(b$point); peak_draws <- add(peak_draws, rowSums(b$draws))
+    }
+  }
+  q <- function(x) stats::quantile(x, c(.025, .975))
+  rows <- list(data.table(scenario = "Previsione attuale", giorni = nrow(temps_by_city[[codes[1]]]),
+                          stima = point, lo = q(draws)[1], hi = q(draws)[2]))
+  cum_p <- point; cum_d <- draws; extra <- 0
+  for (b in blocks) {
+    extra <- extra + b
+    cum_p <- cum_p + b * peak_point; cum_d <- cum_d + b * peak_draws
+    rows[[length(rows) + 1]] <- data.table(
+      scenario = sprintf("Se prosegue altri %d giorni", extra),
+      giorni = nrow(temps_by_city[[codes[1]]]) + extra,
+      stima = cum_p, lo = q(cum_d)[1], hi = q(cum_d)[2])
+  }
+  rbindlist(rows)
+}
+
 # ================================ UI =========================================
 ui <- fluidPage(
   tags$head(tags$style(HTML("
@@ -265,6 +347,32 @@ ui <- fluidPage(
             tabPanel("Tabella", br(), tableOutput("tab"))
           )
         )
+      )
+    ),
+    tabPanel(
+      "Scenari",
+      br(),
+      sidebarLayout(
+        sidebarPanel(
+          width = 3,
+          selectInput("sc_curva", "Curve", choices = NULL),
+          sliderInput("sc_orizzonte", "Giorni di previsione", 1, 16, 7, 1),
+          checkboxInput("sc_debias", "Correggi la distorsione delle previsioni", TRUE),
+          radioButtons("sc_ambito", "Ambito", c("Regione" = "reg", "Singola citt\u00e0" = "city")),
+          conditionalPanel("input.sc_ambito == 'reg'",
+                           selectInput("sc_regione", "Regione", choices = REGIONI,
+                                       selected = if ("Lombardia" %in% REGIONI) "Lombardia"
+                                       else REGIONI[1])),
+          conditionalPanel("input.sc_ambito == 'city'",
+                           selectInput("sc_citta", "Citt\u00e0", choices = sort(CITIES$name))),
+          actionButton("sc_vai", "Calcola scenari", class = "btn-primary"),
+          br(), br(), div(class = "nota",
+                          "Gli scenari oltre l'orizzonte di previsione sono condizionali:",
+                          "assumono che il caldo prosegua al livello dei giorni pi\u00f9 caldi",
+                          "previsti.")
+        ),
+        mainPanel(width = 9, htmlOutput("sc_testo"), br(),
+                  tableOutput("sc_tab"), br(), plotOutput("sc_plot", height = "320px"))
       )
     ),
     tabPanel(
@@ -463,6 +571,74 @@ server <- function(input, output, session) {
   output$msg <- renderUI({
     r <- tryCatch(risultato(), error = function(e) e)
     if (inherits(r, "error")) div(class = "errore", conditionMessage(r)) else NULL
+  })
+
+  # ---- scheda Scenari -------------------------------------------------------
+  observe({
+    nc <- c(PUB, unique(unlist(lapply(BUNDLE$curves, function(x) names(x$recalibrated)))))
+    sel <- if (length(nc) > 1) nc[length(nc)] else nc[1]   # default: curve pi\u00f9 recenti
+    updateSelectInput(session, "sc_curva", choices = setNames(nc, it_label(nc)),
+                      selected = sel)
+  })
+
+  scenari <- eventReactive(input$sc_vai, {
+    cds <- if (input$sc_ambito == "reg") CITIES[region == input$sc_regione, URAU_CODE]
+           else CITIES[name == input$sc_citta, URAU_CODE]
+    if (!length(cds)) stop("Nessuna citt\u00e0 per questa selezione.")
+    as_of <- Sys.Date(); to <- as_of + input$sc_orizzonte
+    set.seed(1)
+    temps <- withProgress(message = "Scarico le previsioni", value = 0, {
+      setNames(lapply(cds, function(cd) {
+        incProgress(1 / length(cds), detail = CITIES[URAU_CODE == cd, name])
+        city_temperature(cd, "fc", as_of, as_of + 1, to, isTRUE(input$sc_debias))
+      }), cds)
+    })
+    temps <- Filter(function(x) !is.null(x) && nrow(x), temps)
+    if (!length(temps)) stop("Previsioni non disponibili.")
+    cds <- names(temps)
+    ons <- vapply(cds, function(cd) onset_probability(temps[[cd]], cd)$p_onset, 0)
+    tab <- scenario_table(cds, temps, input$sc_curva)
+    list(tab = tab, onset = ons, cds = cds, as_of = as_of,
+         titolo = if (input$sc_ambito == "reg") input$sc_regione else input$sc_citta,
+         curva = it_label(input$sc_curva),
+         tmax = max(vapply(temps, function(x) max(x$tmean), 0)))
+  })
+
+  output$sc_testo <- renderUI({
+    r <- tryCatch(scenari(), error = function(e) e)
+    if (inherits(r, "error")) return(div(class = "errore", conditionMessage(r)))
+    p_any <- 1 - prod(1 - r$onset, na.rm = TRUE)
+    n <- nrow(r$tab)
+    f <- function(i) sprintf("%s (%s \u2013 %s)", round(r$tab$stima[i]),
+                             round(r$tab$lo[i]), round(r$tab$hi[i]))
+    HTML(sprintf(paste0(
+      "<p><b>%s.</b> Probabilit\u00e0 che un'ondata di calore inizi entro %d giorni: ",
+      "<b>%s</b> (almeno una citt\u00e0; massimo previsto %.1f \u00b0C).</p>",
+      "<p>Con le previsioni attuali i decessi attribuibili al caldo sono <b>%s</b>. ",
+      "Se il caldo proseguisse, si aggiungerebbero fino a <b>%s</b> complessivi.</p>",
+      "<p class='nota'>Curve: %s. Intervalli al 95%%: incertezza della curva e del ",
+      "livello atteso. Parte di questi decessi \u00e8 anticipata di pochi giorni ",
+      "piuttosto che aggiunta: la validazione mostra un eccesso molto minore nelle ",
+      "due settimane successive rispetto a quanto previsto dalle curve.</p>"),
+      r$titolo, as.integer(input$sc_orizzonte), pct_fmt(p_any), r$tmax,
+      f(1), f(n), r$curva))
+  })
+
+  output$sc_tab <- renderTable({
+    r <- scenari()
+    data.table(Scenario = r$tab$scenario, Giorni = r$tab$giorni,
+               `Decessi attribuibili` = sprintf("%s (%s \u2013 %s)", round(r$tab$stima),
+                                                round(r$tab$lo), round(r$tab$hi)))
+  })
+
+  output$sc_plot <- renderPlot({
+    r <- scenari()
+    d <- copy(r$tab)[, scenario := factor(scenario, scenario)]
+    ggplot(d, aes(scenario, stima)) +
+      geom_col(fill = "#B2182B", alpha = .8, width = .6) +
+      geom_errorbar(aes(ymin = lo, ymax = hi), width = .15, colour = "grey30") +
+      labs(x = NULL, y = "Decessi attribuibili al caldo",
+           title = sprintf("Scenari di durata \u2014 %s", r$titolo)) + tema()
   })
 
   # ---- scheda EuroMOMO ------------------------------------------------------

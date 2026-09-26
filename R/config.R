@@ -10,7 +10,10 @@ cfg <- list(
   country = "IT",
 
   # ---- inputs --------------------------------------------------------------
-  istat_csv  = "data/raw/comuni_giornaliero_30giugno26.csv",
+  istat_csv  = "data/raw/comuni_giornaliero_30giugno26.csv",  # used if already present
+  istat_url  = paste0("https://www.istat.it/storage/dati_mortalita/giugno-2026/",
+                      "decessi-comunali-mese-provvisori-3.zip"),
+  istat_dir  = "data/raw",
   data_dir   = "data",
   zenodo_dir = "data/zenodo",
   cache_dir  = "data/cache",
@@ -25,6 +28,11 @@ cfg <- list(
   urau_levels   = c("CITIES", "GREATER_CITIES"),  # candidates; levels absent from a release are skipped
                                                   # (from 2021 greater cities are inside CITIES)
   lau_year      = 2024,   # GISCO LAU release (closest to current Istat codes)
+  # city composition: "official" uses the Eurostat CITY-LAU correspondence table
+  # (https://ec.europa.eu/eurostat/web/nuts/local-administrative-units, files
+  # "CITY - LAU 2021"); paste its URL below. "geometry" forces the old matching.
+  city_source = "official",
+  city_table_url = "",
   lau_share_min = 0.5,    # a comune belongs to a city if >= 50% of its area is inside
   point_max_dist = 5000,  # metres: nearest polygon accepted when a point falls just outside
   missing_pop_tol = 0.02, # share of a city's population allowed to have no Istat code
@@ -104,6 +112,7 @@ cfg <- list(
   flumomo = list(
     region = "Lombardia", country_code = "IT-LOM",
     code_dir = "R/flumomo",
+    code_url = "https://euromomo.eu/uploads/data/FluMOMO_version_4_2_R.zip",
     work_dir = "flumomo_run",
     years = 2015:2026, agegrp = 4L, # 4 = total, 3 = 65+
     ia_lags = 2, et_lags = 2, ia_restricted = TRUE,
