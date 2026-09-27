@@ -356,7 +356,13 @@ ui <- fluidPage(
         sidebarPanel(
           width = 3,
           selectInput("sc_curva", "Curve", choices = NULL),
+          dateInput("sc_asof", "Data di emissione (macchina del tempo)",
+                    value = Sys.Date(), max = Sys.Date(), format = "dd/mm/yyyy",
+                    language = "it"),
           sliderInput("sc_orizzonte", "Giorni di previsione", 1, 16, 7, 1),
+          div(class = "nota",
+              "Con una data passata si usano le previsioni emesse allora",
+              "(massimo 7 giorni di anticipo)."),
           checkboxInput("sc_debias", "Correggi la distorsione delle previsioni", TRUE),
           radioButtons("sc_ambito", "Ambito", c("Regione" = "reg", "Singola citt\u00e0" = "city")),
           conditionalPanel("input.sc_ambito == 'reg'",
@@ -585,7 +591,9 @@ server <- function(input, output, session) {
     cds <- if (input$sc_ambito == "reg") CITIES[region == input$sc_regione, URAU_CODE]
            else CITIES[name == input$sc_citta, URAU_CODE]
     if (!length(cds)) stop("Nessuna citt\u00e0 per questa selezione.")
-    as_of <- Sys.Date(); to <- as_of + input$sc_orizzonte
+    as_of <- input$sc_asof
+    lead_max <- if (as_of >= Sys.Date()) 16 else FC_MAX_LEAD
+    to <- as_of + min(input$sc_orizzonte, lead_max)
     set.seed(1)
     temps <- withProgress(message = "Scarico le previsioni", value = 0, {
       setNames(lapply(cds, function(cd) {
@@ -594,12 +602,17 @@ server <- function(input, output, session) {
       }), cds)
     })
     temps <- Filter(function(x) !is.null(x) && nrow(x), temps)
-    if (!length(temps)) stop("Previsioni non disponibili.")
+    if (!length(temps))
+      stop("Nessuna previsione disponibile per il ", format(as_of, "%d/%m/%Y"),
+           if (as_of < Sys.Date())
+             ": l'archivio delle emissioni precedenti copre gli ultimi anni e al massimo 7 giorni di anticipo."
+           else ".")
     cds <- names(temps)
     ons <- vapply(cds, function(cd) onset_probability(temps[[cd]], cd)$p_onset, 0)
     tab <- scenario_table(cds, temps, input$sc_curva)
     list(tab = tab, onset = ons, cds = cds, as_of = as_of,
          titolo = if (input$sc_ambito == "reg") input$sc_regione else input$sc_citta,
+         giorni = as.integer(to - as_of),
          curva = it_label(input$sc_curva),
          tmax = max(vapply(temps, function(x) max(x$tmean), 0)))
   })
@@ -620,7 +633,7 @@ server <- function(input, output, session) {
       "livello atteso. Parte di questi decessi \u00e8 anticipata di pochi giorni ",
       "piuttosto che aggiunta: la validazione mostra un eccesso molto minore nelle ",
       "due settimane successive rispetto a quanto previsto dalle curve.</p>"),
-      r$titolo, as.integer(input$sc_orizzonte), pct_fmt(p_any), r$tmax,
+      r$titolo, format(r$as_of, "%d/%m/%Y"), r$giorni, pct_fmt(p_any), r$tmax,
       f(1), f(n), r$curva))
   })
 
@@ -653,9 +666,16 @@ server <- function(input, output, session) {
       if (is.null(reg$daily)) return(NULL)
       d <- as.data.table(reg$daily)[date >= from & date <= to, .(date, observed = deaths)]
     } else {
-      d <- DAILY[URAU_CODE %in% reg$cities & date >= from & date <= to,
-                 .(observed = sum(deaths),
-                   ours = sum(B * fifelse(tmean < mmt, exp(logrr), 1))), by = date]
+      # observed over the whole period from the exported city series; our own
+      # baseline exists only for the test period and is merged where available
+      obs <- if (!is.null(reg$cities_daily))
+        as.data.table(reg$cities_daily)[date >= from & date <= to, .(date, observed = deaths)]
+      else DAILY[URAU_CODE %in% reg$cities & date >= from & date <= to,
+                 .(observed = sum(deaths)), by = date]
+      ours <- DAILY[URAU_CODE %in% reg$cities & date >= from & date <= to,
+                    .(ours = sum(B * fifelse(tmean < mmt, exp(logrr), 1))), by = date]
+      d <- merge(obs, ours, by = "date", all.x = TRUE)
+      if (all(is.na(d$ours))) d[, ours := NULL]
     }
     if (!nrow(d)) return(NULL)
     w <- as.data.table(fm)[order(week_start)]
@@ -667,7 +687,8 @@ server <- function(input, output, session) {
     setorder(d, date)
     d[, `:=`(obs7 = frollmean(observed, 7, align = "center"),
              flu7 = frollmean(flumomo, 7, align = "center"))]
-    if ("ours" %in% names(d)) d[, ours7 := frollmean(ours, 7, align = "center")]
+    if ("ours" %in% names(d) && any(!is.na(d$ours)))
+      d[, ours7 := frollmean(ours, 7, align = "center")]
     d[!is.na(obs7)]
   })
 

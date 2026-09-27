@@ -80,8 +80,10 @@ istat_weekly_euromomo <- function(path, prov, years, procom = NULL) {
 #' @param prov Province codes.
 #' @param age_min Minimum age (0 = all ages).
 #' @param years Years to keep.
+#' @param procom Comune codes to keep instead of whole provinces.
 #' @return data.table `date`, `deaths`.
-istat_daily_area <- function(path, prov, age_min = 0, years = 2015:2026) {
+istat_daily_area <- function(path, prov, age_min = 0, years = 2015:2026,
+                             procom = NULL) {
   hdr <- names(data.table::fread(path, nrows = 0))
   tcols <- grep("^T_[0-9]{2}$", hdr, value = TRUE)
   tcols <- tcols[(as.integer(sub("T_", "", tcols)) + 2000L) %in% years]
@@ -89,7 +91,7 @@ istat_daily_area <- function(path, prov, age_min = 0, years = 2015:2026) {
                          colClasses = list(character = c("COD_PROVCOM", "GE")),
                          na.strings = c("", "NA", "n.d."))
   d[, PRO_COM := pad_procom(COD_PROVCOM)]
-  d <- d[substr(PRO_COM, 1, 3) %in% prov]
+  d <- if (!is.null(procom)) d[PRO_COM %in% procom] else d[substr(PRO_COM, 1, 3) %in% prov]
   if (age_min > 0) d <- d[CL_ETA >= (if (age_min == 20) 5L else floor(age_min / 5) + 1L)]
   long <- data.table::melt(d, id.vars = "GE", measure.vars = tcols,
                            variable.name = "yy", value.name = "deaths")

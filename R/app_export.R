@@ -130,6 +130,14 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
                                     URAU_CODE]),
       daily = if (!is.null(istat_file))
         istat_daily_area(istat_file, cfg$flumomo$provinces$prov, 0, cfg$flumomo$years)
+      else NULL,
+      # observed deaths of the validated cities over the same years: the daily
+      # table only covers the test period, so the EuroMOMO tab would otherwise
+      # show nothing before it
+      cities_daily = if (!is.null(istat_file))
+        istat_daily_area(istat_file, cfg$flumomo$provinces$prov, 0, cfg$flumomo$years,
+                         procom = unique(crosswalk$map[
+                           substr(PRO_COM, 1, 3) %in% cfg$flumomo$provinces$prov, PRO_COM]))
       else NULL),
     flumomo = list(
       region = flumomo_weekly(flumomo_region, c(2L, 3L)),
