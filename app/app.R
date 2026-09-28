@@ -287,6 +287,88 @@ scenario_table <- function(codes, temps_by_city, curve_name, blocks = c(5, 5), n
   rbindlist(rows)
 }
 
+#' Cumulative paths: reconstruction, forecast, and duration scenarios
+#'
+#' Builds one trajectory of cumulative heat deaths per scenario, in the style
+#' of the IPCC pathway figures: a single observed history up to the issue
+#' date, then branches. Each branch keeps its own 95% band, and the bands
+#' widen with time because the draws accumulate.
+#'
+#' @param codes Cities.
+#' @param as_of Issue date (the vertical line in the chart).
+#' @param horizon Days of forecast.
+#' @param back Days of reconstruction shown before the issue date.
+#' @param curve_name Curve set.
+#' @param debias Correct the forecast bias.
+#' @param blocks Additional blocks of days, each a scenario.
+#' @param nsim Draws.
+#' @return List with `paths` (date, scenario, cum, lo, hi), `as_of`, `temps`.
+scenario_paths <- function(codes, as_of, horizon, back, curve_name, debias,
+                           blocks = c(5, 5), nsim = NSIM) {
+  hist_to <- min(as_of, Sys.Date() - 6)
+  hist_from <- hist_to - back
+  acc_hist <- NULL; acc_fc <- NULL; peak <- NULL; temps <- list()
+  add <- function(a, b) if (is.null(a)) b else
+    list(dates = a$dates, draws = a$draws + b$draws)
+  for (cd in codes) {
+    th <- try(city_temperature(cd, "era5", as_of, hist_from, hist_to, FALSE), silent = TRUE)
+    # the forecast call also returns the days between the end of ERA5-Land and
+    # the issue date, so the reconstruction runs up to the vertical line
+    tf <- try(city_temperature(cd, "fc", as_of, hist_to + 1, as_of + horizon, debias),
+              silent = TRUE)
+    if (inherits(tf, "try-error") || !nrow(tf)) next
+    gap <- tf[date <= as_of]; tf <- tf[date > as_of]
+    if (!inherits(th, "try-error") && nrow(th))
+      th <- rbind(th, gap, fill = TRUE)[order(date)] else th <- gap
+    if (nrow(th)) {
+      a <- city_attributable(cd, th, curve_name, nsim)
+      if (!is.null(a)) acc_hist <- add(acc_hist, list(dates = th$date, draws = a$draws))
+    }
+    if (!nrow(tf)) next
+    temps[[cd]] <- tf
+    b <- city_attributable(cd, tf, curve_name, nsim)
+    if (is.null(b)) next
+    acc_fc <- add(acc_fc, list(dates = tf$date, draws = b$draws))
+    hot <- tf[order(-tmean)][seq_len(min(3, .N))]
+    one <- data.table(date = max(tf$date) + 1, tmean = mean(hot$tmean), lead = max(tf$lead))
+    c1 <- city_attributable(cd, one, curve_name, nsim)
+    if (!is.null(c1)) peak <- if (is.null(peak)) c1$draws[, 1] else peak + c1$draws[, 1]
+  }
+  if (is.null(acc_fc)) return(NULL)
+  q <- function(m) data.table(cum = colMeans(m),
+                              lo = apply(m, 2, stats::quantile, .025),
+                              hi = apply(m, 2, stats::quantile, .975))
+  cum_hist <- if (!is.null(acc_hist)) t(apply(acc_hist$draws, 1, cumsum)) else NULL
+  base <- if (is.null(cum_hist)) 0 else cum_hist[, ncol(cum_hist)]
+  paths <- list()
+  if (!is.null(cum_hist))
+    paths[[1]] <- cbind(data.table(date = acc_hist$dates, scenario = "Ricostruzione"),
+                        q(cum_hist))
+  cum_fc <- sweep(t(apply(acc_fc$draws, 1, cumsum)), 1, base, "+")
+  join <- function(dt, date0, m0) if (is.null(m0)) dt else
+    rbind(cbind(data.table(date = date0, scenario = dt$scenario[1]), q(m0)), dt)
+  last_hist <- if (!is.null(cum_hist)) max(acc_hist$dates) else NULL
+  paths[[length(paths) + 1]] <- join(
+    cbind(data.table(date = acc_fc$dates, scenario = "Previsione"), q(cum_fc)),
+    last_hist, if (!is.null(cum_hist)) cum_hist[, ncol(cum_hist), drop = FALSE] else NULL)
+  end <- cum_fc[, ncol(cum_fc)]; last <- max(acc_fc$dates); extra <- 0
+  if (!is.null(peak)) for (b in blocks) {
+    days <- seq_len(b)
+    m <- sapply(days, function(k) end + k * peak)
+    if (is.null(dim(m))) m <- matrix(m, nrow = length(end))
+    extra <- extra + b
+    paths[[length(paths) + 1]] <- join(
+      cbind(data.table(date = last + days,
+                       scenario = sprintf("Se prosegue (+%d giorni)", extra)), q(m)),
+      last, matrix(end, ncol = 1))
+    end <- m[, ncol(m)]; last <- last + b
+  }
+  out <- rbindlist(paths)
+  out[, date := as.Date(date, origin = "1970-01-01")]   # rbind can drop the class
+  list(paths = out, as_of = as_of, temps = temps,
+       hist_from = hist_from, hist_to = hist_to)
+}
+
 # ================================ UI =========================================
 ui <- fluidPage(
   tags$head(tags$style(HTML("
@@ -360,6 +442,7 @@ ui <- fluidPage(
                     value = Sys.Date(), max = Sys.Date(), format = "dd/mm/yyyy",
                     language = "it"),
           sliderInput("sc_orizzonte", "Giorni di previsione", 1, 16, 7, 1),
+          sliderInput("sc_back", "Giorni di ricostruzione mostrati", 0, 60, 30, 5),
           div(class = "nota",
               "Con una data passata si usano le previsioni emesse allora",
               "(massimo 7 giorni di anticipo)."),
@@ -378,7 +461,7 @@ ui <- fluidPage(
                           "previsti.")
         ),
         mainPanel(width = 9, htmlOutput("sc_testo"), br(),
-                  tableOutput("sc_tab"), br(), plotOutput("sc_plot", height = "320px"))
+                  plotOutput("sc_plot", height = "420px"), br(), tableOutput("sc_tab"))
       )
     ),
     tabPanel(
@@ -394,6 +477,8 @@ ui <- fluidPage(
                          start = as.Date(format(BUNDLE$data_end, "%Y-01-01")),
                          end = BUNDLE$data_end, format = "dd/mm/yyyy", language = "it",
                          separator = " \u2013 "),
+          radioButtons("mm_riferimento", "Attesa di riferimento (area colorata)",
+                       c("FluMOMO" = "flu", "Modello del progetto" = "our")),
           div(class = "nota",
               "Due attese indipendenti: il modello del progetto (giornaliero, et\u00e0 20+,",
               "senza caldo) e il codice ufficiale FluMOMO (settimanale, senza temperature",
@@ -610,7 +695,9 @@ server <- function(input, output, session) {
     cds <- names(temps)
     ons <- vapply(cds, function(cd) onset_probability(temps[[cd]], cd)$p_onset, 0)
     tab <- scenario_table(cds, temps, input$sc_curva)
-    list(tab = tab, onset = ons, cds = cds, as_of = as_of,
+    paths <- scenario_paths(cds, as_of, input$sc_orizzonte, input$sc_back,
+                            input$sc_curva, isTRUE(input$sc_debias))
+    list(tab = tab, paths = paths, onset = ons, cds = cds, as_of = as_of,
          titolo = if (input$sc_ambito == "reg") input$sc_regione else input$sc_citta,
          giorni = as.integer(to - as_of),
          curva = it_label(input$sc_curva),
@@ -646,12 +733,25 @@ server <- function(input, output, session) {
 
   output$sc_plot <- renderPlot({
     r <- scenari()
-    d <- copy(r$tab)[, scenario := factor(scenario, scenario)]
-    ggplot(d, aes(scenario, stima)) +
-      geom_col(fill = "#B2182B", alpha = .8, width = .6) +
-      geom_errorbar(aes(ymin = lo, ymax = hi), width = .15, colour = "grey30") +
-      labs(x = NULL, y = "Decessi attribuibili al caldo",
-           title = sprintf("Scenari di durata \u2014 %s", r$titolo)) + tema()
+    shiny::validate(shiny::need(!is.null(r$paths), "Scenari non disponibili."))
+    d <- r$paths$paths
+    extra <- setdiff(unique(d$scenario), c("Ricostruzione", "Previsione"))
+    extra <- extra[order(as.numeric(gsub("\\D", "", extra)))]   # +5 before +10
+    ord <- c("Ricostruzione", "Previsione", extra)
+    d[, scenario := factor(scenario, ord)]
+    cols <- setNames(c("#1F2933", "#B2182B", "#E08214", "#8073AC", "#4393C3")[seq_along(ord)],
+                     ord)
+    ggplot(d, aes(date, cum, colour = scenario, fill = scenario)) +
+      geom_vline(xintercept = as.numeric(r$as_of), colour = "grey45", linetype = "22") +
+      annotate("text", x = r$as_of, y = Inf, vjust = 1.5, hjust = -0.05, size = 3.4,
+               colour = "grey35", label = "inizio previsione") +
+      geom_ribbon(aes(ymin = lo, ymax = hi), alpha = .18, colour = NA) +
+      geom_line(linewidth = 1) +
+      scale_colour_manual(values = cols) + scale_fill_manual(values = cols) +
+      labs(title = sprintf("Decessi cumulati attribuibili al caldo \u2014 %s", r$titolo),
+           subtitle = paste("Ricostruzione ERA5-Land fino alla data di emissione,",
+                            "poi previsione e scenari di durata; bande al 95%"),
+           x = NULL, y = "Decessi cumulati", colour = NULL, fill = NULL) + tema()
   })
 
   # ---- scheda EuroMOMO ------------------------------------------------------
@@ -693,37 +793,44 @@ server <- function(input, output, session) {
   })
 
   output$g_momo <- renderPlot({
+    reg <- BUNDLE$region
+    shiny::validate(
+      shiny::need(!is.null(BUNDLE$flumomo),
+                  "Il file app_data.rds non contiene i risultati FluMOMO: eseguire targets::tar_make()."),
+      shiny::need(input$mm_ambito != "cit" || !is.null(reg$cities_daily),
+                  paste("Il file app_data.rds e' anteriore all'esportazione dei decessi",
+                        "delle citta' validate: eseguire targets::tar_make() e copiare",
+                        "il nuovo app_data.rds accanto ad app.R.")))
     d <- momo()
-    # shiny::validate explicitly: jsonlite masks validate() when attached later
-    shiny::validate(shiny::need(
-      !is.null(d) && nrow(d),
-      paste("Dati non disponibili per il periodo scelto:",
-            "verificare le date e che i target FluMOMO siano stati eseguiti.")))
+    shiny::validate(shiny::need(!is.null(d) && nrow(d),
+                                "Nessun dato per il periodo scelto."))
     lab_flu <- "Attesi FluMOMO"; lab_our <- "Attesi senza caldo (progetto)"
-    cols <- c("Osservati" = "#1F2933", "#D95F02", "#2C7FB8")
-    names(cols)[2:3] <- c(lab_flu, lab_our)
-    p1 <- "Decessi al giorno (media mobile 7 giorni)"
-    p2 <- "Eccesso cumulato"
-    line <- function(v, serie, pannello) {
-      if (is.null(v) || !length(v)) return(NULL)
-      data.table(date = d$date, serie = serie, v = as.numeric(v), pannello = pannello)
-    }
-    parts <- list(line(d$obs7, "Osservati", p1), line(d$flu7, lab_flu, p1),
-                  line(cumsum(d$observed - d$flumomo), lab_flu, p2))
-    if ("ours" %in% names(d)) parts <- c(parts, list(
-      line(d$ours7, lab_our, p1), line(cumsum(d$observed - d$ours), lab_our, p2)))
-    pd <- rbindlist(Filter(Negate(is.null), parts), use.names = TRUE)[!is.na(v)]
-    ggplot(pd, aes(date, v, colour = serie)) +
-      geom_hline(yintercept = 0, colour = "grey85") +
-      geom_line(linewidth = .9) +
-      facet_wrap(~ pannello, ncol = 1, scales = "free_y") +
-      scale_colour_manual(values = cols) +
-      labs(title = sprintf("%s, %s \u2013 %s \u2014 %s", BUNDLE$region$name,
-                           format(min(d$date), "%d/%m/%Y"), format(max(d$date), "%d/%m/%Y"),
+    has_our <- "ours7" %in% names(d) && any(!is.na(d$ours7))
+    ref <- if (has_our && identical(input$mm_riferimento, "our")) d$ours7 else d$flu7
+    ref_lab <- if (has_our && identical(input$mm_riferimento, "our")) lab_our else lab_flu
+    d[, `:=`(ref = ref)]
+    total <- round(sum(d$observed - if (identical(ref_lab, lab_our)) d$ours else d$flumomo,
+                       na.rm = TRUE))
+    p <- ggplot(d, aes(date)) +
+      geom_ribbon(aes(ymin = ref, ymax = pmax(obs7, ref)), fill = "#C0392B", alpha = .28) +
+      geom_ribbon(aes(ymin = pmin(obs7, ref), ymax = ref), fill = "#3A8DAE", alpha = .18) +
+      geom_line(aes(y = ref, colour = ref_lab), linewidth = .8, linetype = "22")
+    if (has_our && !identical(ref_lab, lab_our))
+      p <- p + geom_line(aes(y = ours7, colour = lab_our), linewidth = .7, linetype = "22")
+    if (identical(ref_lab, lab_our))
+      p <- p + geom_line(aes(y = flu7, colour = lab_flu), linewidth = .7, linetype = "22")
+    p + geom_line(aes(y = obs7, colour = "Osservati"), linewidth = 1) +
+      scale_colour_manual(values = setNames(c("#1F2933", "#2C7FB8", "#D95F02"),
+                                            c("Osservati", lab_our, lab_flu)),
+                          breaks = c("Osservati", lab_our, lab_flu)) +
+      labs(title = sprintf("Mortalit\u00e0 giornaliera \u2014 %s, %s", BUNDLE$region$name,
                            if (input$mm_ambito == "reg") "tutti i comuni"
                            else "citt\u00e0 validate"),
-           x = NULL, y = NULL) + tema() +
-      theme(strip.text = element_text(hjust = 0, face = "bold", colour = "grey25"))
+           subtitle = sprintf(paste("Medie mobili a 7 giorni. In rosso i giorni sopra",
+                                    "l'attesa (%s), in azzurro quelli sotto (saldo %s,",
+                                    "%s \u2013 %s)"), ref_lab, format(total, big.mark = "."),
+                              format(min(d$date), "%d/%m"), format(max(d$date), "%d/%m/%Y")),
+           x = NULL, y = "Decessi al giorno", colour = NULL) + tema()
   })
 
   output$tab_momo <- renderTable({
