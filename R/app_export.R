@@ -43,7 +43,7 @@ flumomo_weekly <- function(res, agegrps) {
 export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
                               fc, era5, data_end, cfg, path = "app/app_data.rds",
                               flumomo_region = NULL, flumomo_cities = NULL,
-                              istat_file = NULL) {
+                              istat_file = NULL, mort = NULL) {
   ensure_dir(dirname(path))
   codes <- sort(unique(cf$daily$URAU_CODE))
   ct <- cities[URAU_CODE %in% codes]
@@ -105,6 +105,11 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
   })
 
   # ---- daily deaths and baseline --------------------------------------------
+  # every observed day of every city, so the app can show mortality before the
+  # period the counterfactual is fitted on
+  deaths_long <- if (!is.null(mort))
+    mort[, .(deaths = sum(deaths)), by = .(URAU_CODE, date)][order(URAU_CODE, date)]
+  else NULL
   daily <- cf$daily[, .(URAU_CODE, agegroup, date, deaths, B,
                         B_logsd = if ("B_logsd" %in% names(cf$daily)) B_logsd else 0,
                         tmean, logrr, mmt)]
@@ -123,7 +128,7 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
     fc_bias = fc_bias, forecast_model = cfg$forecast_model,
     regions = simplify(nuts[, "region"], 1000),
     city_geom = if (!is.null(city_geom)) simplify(city_geom, 500) else NULL,
-    curves = curves, daily = daily, delta = check$delta,
+    curves = curves, daily = daily, deaths_long = deaths_long, delta = check$delta,
     region = list(
       name = cfg$flumomo$region,
       cities = unique(crosswalk$map[substr(PRO_COM, 1, 3) %in% cfg$flumomo$provinces$prov,

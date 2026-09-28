@@ -129,7 +129,8 @@ list(
                                          crosswalk, gisco_files, exposure_check,
                                          forecasts, era5_test, data_end, config,
                                          "app/app_data.rds",
-                                         flumomo_results, flumomo_cities, istat_file),
+                                         flumomo_results, flumomo_cities, istat_file,
+                                         mort),
              format = "file"),
 
   # ---- report ---------------------------------------------------------------
