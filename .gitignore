@@ -6,3 +6,5 @@ renv
 rsconnect
 _targets
 data
+
+*.rds
