@@ -28,10 +28,19 @@ cfg <- list(
   urau_levels   = c("CITIES", "GREATER_CITIES"),  # candidates; levels absent from a release are skipped
                                                   # (from 2021 greater cities are inside CITIES)
   lau_year      = 2024,   # GISCO LAU release (closest to current Istat codes)
-  # city composition: "official" uses the Eurostat CITY-LAU correspondence table
-  # (https://ec.europa.eu/eurostat/web/nuts/local-administrative-units, files
-  # "CITY - LAU 2021"); paste its URL below. "geometry" forces the old matching.
-  city_source = "official",
+  # city composition:
+  #   "istat"    official Istat composition of the Cities 2021 (SITUAS report
+  #              "Composizione delle Citta (Cities) 2021"), shipped with the
+  #              repository: Urban Audit code -> Istat comune codes, no
+  #              inference. See R/istat_cities.R to refresh it.
+  #   "official" Eurostat CITY-LAU correspondence table
+  #              (https://ec.europa.eu/eurostat/web/nuts/local-administrative-units,
+  #              files "CITY - LAU 2021"); paste its URL in city_table_url.
+  #   "geometry" the original matching (city point in GISCO polygons).
+  # Whatever is chosen, the geometric matching is still computed and the
+  # checks report comune by comune how far the two agree.
+  city_source = "istat",
+  istat_cities_file = "reference/istat_cities_2021.csv",
   city_table_url = "",
   lau_share_min = 0.5,    # a comune belongs to a city if >= 50% of its area is inside
   point_max_dist = 5000,  # metres: nearest polygon accepted when a point falls just outside

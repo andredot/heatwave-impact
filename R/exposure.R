@@ -13,7 +13,11 @@
 #' @param cfg Configuration list.
 #' @return data.table `URAU_CODE`, `lat`, `lon`, `n_cells`.
 city_grid_points <- function(gisco, crosswalk, cities, cfg) {
-  sel <- unique(crosswalk$checks[analysed == TRUE, .(URAU_CODE, level, poly_code)])
+  # poly_level/poly_code are the GISCO polygon, which is what the city
+  # boundary means here; the retained composition (`level`) can come from an
+  # official table and does not name a GISCO layer.
+  sel <- unique(crosswalk$checks[analysed == TRUE,
+                                 .(URAU_CODE, level = poly_level, poly_code)])
   out <- list()
   for (f in gisco[grepl("^urau_", basename(gisco))]) {
     lvl <- sub("^urau_(.*)_([0-9]{4})_[A-Z]{2}\\.gpkg$", "\\1 \\2", basename(f))
@@ -40,8 +44,16 @@ city_grid_points <- function(gisco, crosswalk, cities, cfg) {
   }
   pts <- data.table::rbindlist(out)
   miss <- setdiff(cities$URAU_CODE, pts$URAU_CODE)
-  if (length(miss))
+  if (length(miss)) {
+    # Small cities hold no ERA5-Land cell centre, which is expected; a large
+    # share falling back means the polygons were not found at all, and the
+    # exposure would silently become a single point per city.
+    if (length(miss) > 0.5 * nrow(cities))
+      warning(length(miss), " of ", nrow(cities), " cities have no grid cell inside ",
+              "their polygon and fall back to the city point. Check that ",
+              "crosswalk$checks$poly_level matches the GISCO files.", call. = FALSE)
     pts <- rbind(pts, cities[URAU_CODE %in% miss, .(URAU_CODE, lat, lon, n_cells = 1L)])
+  }
   pts[]
 }
 

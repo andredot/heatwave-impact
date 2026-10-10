@@ -1,35 +1,31 @@
 # Open items
 
 ## 1. Replace the geometric city crosswalk with an official correspondence table
-Status: DONE (branch inputs-and-scenarios). Set `city_table_url` in R/config.R to the
-Eurostat "CITY - LAU 2021" file; with an empty URL the pipeline falls back to the
-geometric matching and says so.
+Status: DONE (branch istat-city-composition). The source is the Istat SITUAS report
+*Composizione delle Città (Cities) 2021* (EU Regulation 2019/1130): 89 Cities, 11 of
+them Greater Cities, 298 comuni. It carries both keys we need - the Urban Audit code
+of Masselot's curves and the six-digit Istat comune code of the mortality file - so
+the crosswalk needs no name matching and no population heuristic. A copy lives in
+`reference/istat_cities_2021.csv` (28 kB, fixed 2021 definition), so a fresh clone
+reproduces the geography with no download; `R/istat_cities.R` documents how to
+re-export it from https://situas.istat.it/web/ for a future release.
 
-Today `overlay_cities()` + `finalize_crosswalk()` infer which comuni make up each
-Urban Audit city: the city point is located in the GISCO polygons of two releases
-and two levels, and the candidate whose population is closest to Masselot's is
-chosen. It works (85 cities, population ratios 0.9-1.1, Milan as a 96-comune
-greater city), but it is inference where an authoritative list exists.
+`cfg$city_source` selects `"istat"` (default), `"official"` (Eurostat CITY-LAU table
+via `city_table_url`) or `"geometry"`. Whichever is chosen, the geometric matching is
+still computed and `finalize_crosswalk()` reports, city by city, how many comuni the
+two compositions share (`n_comuni`, `n_comuni_geo`, `shared_comuni`, `agreement`), so
+the inference this project started from is now measured rather than trusted. All the
+earlier checks (codes present in Istat, name, population ratio, deaths ratio against
+the metadata rates) are unchanged and the override file still applies.
 
-Wanted instead: an official file listing, for each city / greater city / metro
-area, the member municipalities with their Istat codes. Candidate sources to
-check:
-- Eurostat Cities (Urban Audit) database: https://ec.europa.eu/eurostat/web/cities/database
-  (the LAU-city correspondence table Masselot himself used: "CITY-LAU-2021")
-- Eurostat metropolitan regions: https://ec.europa.eu/eurostat/web/metropolitan-regions/database
-- Eurostat LAU-NUTS correspondence (annual xlsx, has CITY_ID / GREATER_CITY_ID / FUA_ID columns)
-- Istat Urban Audit quality note: https://www.istat.it/scheda-qualita/urban-audit/
-- Istat codes of comuni, province and regions:
-  https://www.istat.it/classificazione/codici-dei-comuni-delle-province-e-delle-regioni/
+Not used: the FUA report from the same portal (pfun 446). A Functional Urban Area is
+the city plus its commuting belt and is not interchangeable with a City - it would
+put a far larger population under the same curve. Masselot's unit is the City.
 
-Keep: every validation check in `finalize_crosswalk()` (codes present in Istat,
-name match, population ratio, deaths ratio against the metadata rates) and the
-report section that shows them. They become the check on the official table
-rather than on our inference, and the override file stays.
-
-Watch for: the code renumbering between Urban Audit releases (Masselot's codes are
-the 2020/2021 numbering, where greater cities are merged into the city level), and
-comune code changes between the correspondence table's year and the Istat file.
+Still to watch: comune code changes between the 2021 composition and the Istat
+mortality release (handled by `in_istat` + `missing_pop_tol`), and the fact that
+exposure still averages ERA5-Land over the GISCO Urban Audit polygon chosen
+geometrically, not over the union of the official comuni.
 
 ## 2. Download the Istat mortality file instead of receiving it by hand
 Status: DONE (branch inputs-and-scenarios): `download_istat()` + `istat_url` in config.

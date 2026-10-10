@@ -71,7 +71,8 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
   ct[is.na(region), region := "(non assegnata)"]
 
   city_geom <- NULL
-  sel <- unique(crosswalk$checks[URAU_CODE %in% codes, .(URAU_CODE, level, poly_code)])
+  sel <- unique(crosswalk$checks[URAU_CODE %in% codes,
+                                 .(URAU_CODE, level = poly_level, poly_code)])
   for (f in gisco[grepl("^urau_", basename(gisco))]) {
     lvl <- sub("^urau_(.*)_([0-9]{4})_[A-Z]{2}\\.gpkg$", "\\1 \\2", basename(f))
     want <- sel[level == lvl]

@@ -41,10 +41,20 @@ list(
   # ---- city definition ------------------------------------------------------
   tar_target(gisco_files, download_gisco(config), format = "file"),
   tar_target(overlay, overlay_cities(gisco_files, erf$metadata, config)),
+  tar_target(lau_pop, read_lau_population(gisco_files)),
+  # official Istat composition of the Cities 2021 (shipped with the repository)
+  tar_target(istat_cities_file, locate_istat_cities(config), format = "file"),
+  tar_target(istat_cities, read_istat_cities(istat_cities_file)),
+  tar_target(istat_map, istat_city_map(istat_cities, erf$metadata, lau_pop)),
+  tar_target(istat_coverage, istat_city_coverage(istat_cities, erf$metadata)),
+  # Eurostat CITY-LAU table, used when config$city_source is "official"
   tar_target(city_table, read_city_lau_table(config)),
-  tar_target(city_map, official_city_map(
-    city_table, erf$metadata,
-    unique(overlay$members[, .(PRO_COM, lau_pop)]))),
+  tar_target(city_map, switch(
+    config$city_source,
+    istat    = istat_map,
+    official = official_city_map(city_table, erf$metadata,
+                                 unique(lau_pop[, .(PRO_COM, lau_pop)])),
+    NULL)),
 
   # ---- mortality ------------------------------------------------------------
   tar_target(istat_file, download_istat(config), format = "file"),

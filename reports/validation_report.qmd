@@ -108,19 +108,63 @@ Masselot's cities are Urban Audit cities, coded with Eurostat's 2020/2021
 numbering, in which the *greater city* is the default unit wherever the
 urban centre extends well beyond the central municipality (e.g. Milan,
 Naples): from the 2021 release greater cities are merged into the city
-level, so a single "city" polygon can cover dozens of comuni. Urban Audit
-codes were also renumbered between releases, so matching polygons by code
-can silently select another city. Cities are therefore
-matched geographically: each city's Urban Audit point (from Masselot's
-metadata) is located in the GISCO `r cfg$urau_year` polygons of every level
+level, so a single "city" polygon can cover dozens of comuni. Which comuni
+make up each city therefore has to be established before any death can be
+counted, and it is not a detail: Milan as a greater city is three times
+Milan as a comune, and the curve would be applied to the wrong population.
+
+The composition is taken from the source that defines it. Istat publishes,
+in its SITUAS portal, the report *Composizione delle Città (Cities) 2021*,
+which lists every City and Greater City of EU Regulation 2019/1130 with its
+Urban Audit code and the comuni that compose it, with their Istat codes:
+`r format(nrow(tar_read(istat_cities)), big.mark = ",")` comuni in
+`r data.table::uniqueN(tar_read(istat_cities)$city_code)` cities, of which
+`r data.table::uniqueN(tar_read(istat_cities)[level == "greater city", city_code])`
+greater cities. Those are exactly the two keys this analysis needs — the
+Urban Audit code of Masselot's curves and the comune code of the Istat
+mortality file — so the crosswalk involves no name matching and no
+inference. Codes are matched on the six-character stem, since releases
+differ in the trailing version digit (`IT001C` vs `IT001C1`). The file is
+shipped with the repository (`r basename(tar_read(istat_cities_file))`), so
+a fresh run reproduces the geography without a download.
+
+The geographic matching this project started from is still computed as a
+check: each city's Urban Audit point (from Masselot's metadata) is located
+in the GISCO `r cfg$urau_year` polygons of every level
 (`r paste(cfg$urau_levels, collapse = ", ")`); each polygon containing the
 point is a candidate, made of the comuni with at least
-`r pct(cfg$lau_share_min)` of their area inside it. The candidate whose
-population is closest to Masselot's is retained. The choice is then checked
-against the Istat deaths aged 20+ in 2011-2019 and the deaths implied by
-Masselot's population structure and death rates: cities failing this check
-are excluded, since their mortality would not be the population the curve
-describes.
+`r pct(cfg$lau_share_min)` of their area inside it, and the candidate whose
+population is closest to Masselot's is retained. The table below reports,
+city by city, how far the two compositions agree. The retained composition
+is then checked against the Istat deaths aged 20+ in 2011-2019 and the
+deaths implied by Masselot's population structure and death rates: cities
+failing this check are excluded, since their mortality would not be the
+population the curve describes.
+
+```{r crosswalk-source}
+cov <- tar_read(istat_coverage)
+cat("Composition used:", xw$source, "\n")
+if (!is.null(cov)) {
+  kbl(cov$cities[, .N, by = .(`In the Istat report` = matched)],
+      col.names = c("In the Istat report", "Cities of the metadata"))
+  miss <- cov$cities[matched == FALSE, .(City = name, Code = URAU_CODE,
+                                         Population = fmt(pop, 0))]
+  if (nrow(miss)) kbl(miss, caption = "Cities of Masselot's metadata absent from the Istat report")
+}
+```
+
+```{r crosswalk-agreement}
+ag <- xw$checks[!is.na(agreement), .(City = name, Level = level,
+                                     Comuni = n_comuni, `Comuni (geometric)` = n_comuni_geo,
+                                     Shared = shared_comuni, Agreement = fmt(agreement))]
+kbl(xw$checks[!is.na(agreement), .(Cities = .N,
+      `Identical composition` = sum(agreement == 1),
+      `Agreement below 0.9` = sum(agreement < 0.9))],
+    caption = "Agreement between the official composition and the geometric matching")
+dis <- ag[as.numeric(Agreement) < 1]
+if (nrow(dis)) kbl(dis[order(as.numeric(Agreement))],
+                   caption = "Cities where the two compositions differ")
+```
 
 ```{r crosswalk-summary}
 ck <- xw$checks
@@ -130,10 +174,11 @@ kbl(ck[, .N, by = .(level)][order(-N)], col.names = c("Definition retained", "Ci
 ```
 
 ```{r crosswalk-greater}
-gc <- ck[level != "CITIES" & !is.na(level),
-         .(City = name, Polygon = poly_name, Level = level, Comuni = n_comuni,
+gc <- ck[!is.na(n_comuni) & n_comuni > 1,
+         .(City = name, Level = level, Comuni = n_comuni,
            `Pop. ratio` = fmt(pop_ratio), `Deaths ratio` = fmt(deaths_ratio), Status = status)]
-if (nrow(gc)) kbl(gc, caption = "Cities defined as greater cities (or FUA) rather than the single comune")
+if (nrow(gc)) kbl(gc[order(-Comuni)],
+                  caption = "Cities made of more than one comune (greater cities)")
 ```
 
 ```{r crosswalk-plot, fig.height=4.5}

@@ -124,6 +124,28 @@ overlay_cities <- function(gisco, metadata, cfg) {
   list(candidates = cand, members = memb)
 }
 
+#' Population of every comune, from the GISCO LAU layer
+#'
+#' The overlay only describes the comuni inside a candidate polygon, so a
+#' comune that an official correspondence table assigns to a city but that
+#' lies outside the polygon would have no population. This reads the whole
+#' layer, which the alignment checks need.
+#'
+#' @param gisco Output of [download_gisco()].
+#' @return data.table `PRO_COM`, `LAU_NAME`, `lau_pop`.
+read_lau_population <- function(gisco) {
+  f <- gisco[grepl("^lau_", basename(gisco))][1]
+  lau <- sf::st_read(f, quiet = TRUE)
+  idcol   <- intersect(c("LAU_ID", "GISCO_ID"), names(lau))[1]
+  popcol  <- grep("^POP_", names(lau), value = TRUE)[1]
+  namecol <- intersect(c("LAU_NAME", "LAU_LABEL"), names(lau))[1]
+  d <- data.table::data.table(
+    PRO_COM  = pad_procom(sub("^[A-Z]{2}_", "", lau[[idcol]])),
+    LAU_NAME = as.character(lau[[namecol]]),
+    lau_pop  = if (is.na(popcol)) NA_real_ else as.numeric(lau[[popcol]]))
+  unique(d[!is.na(PRO_COM)])
+}
+
 #' Choose each city's definition and run the alignment checks
 #'
 #' Among the candidate polygons of a city (see [overlay_cities()]), the one
@@ -168,12 +190,13 @@ finalize_crosswalk <- function(overlay, istat, erf, cfg, official = NULL) {
 
   use_official <- !is.null(official) && nrow(official) &&
     !identical(cfg$city_source, "geometry")
-  map <- if (use_official) data.table::copy(official) else {
+  geo <- {
     m <- merge(pick[, .(URAU_CODE, level, poly_code)],
                overlay$members[share_lau >= cfg$lau_share_min],
                by = c("level", "poly_code"), allow.cartesian = TRUE)
     m[, .(URAU_CODE, level, PRO_COM, LAU_NAME, lau_pop)]
   }
+  map <- if (use_official) data.table::copy(official) else geo
   if (nrow(ov[action %in% c("add", "remove")])) {
     ov[, PRO_COM := pad_procom(PRO_COM)]
     drop <- ov[action == "remove"]
@@ -201,7 +224,11 @@ finalize_crosswalk <- function(overlay, istat, erf, cfg, official = NULL) {
                  lau_pop = sum(lau_pop, na.rm = TRUE)), by = .(URAU_CODE, level)]
   chk <- merge(meta[, .(URAU_CODE, name, meta_name = URAU_NAME, pop = as.numeric(pop), inmcc)],
                chk, by = "URAU_CODE", all.x = TRUE)
-  chk <- merge(chk, pick[, .(URAU_CODE, poly_code, poly_name, n_candidates = NA_integer_)],
+  # `level` is the composition retained (which may come from an official
+  # table); `poly_level` / `poly_code` stay the GISCO polygon the city point
+  # falls in, which is what the exposure average and the app map need.
+  chk <- merge(chk, pick[, .(URAU_CODE, poly_level = level, poly_code, poly_name,
+                             n_candidates = NA_integer_)],
                by = "URAU_CODE", all.x = TRUE)
   if (use_official) chk[, poly_name := meta$URAU_NAME[match(URAU_CODE, meta$URAU_CODE)]]
   chk[, n_candidates := vapply(URAU_CODE, function(cd) sum(cand$URAU_CODE == cd), 0L)]
@@ -213,6 +240,21 @@ finalize_crosswalk <- function(overlay, istat, erf, cfg, official = NULL) {
     a <- norm_name(a); b <- norm_name(b)
     !is.na(a) && !is.na(b) && (grepl(a, b, fixed = TRUE) || grepl(b, a, fixed = TRUE))
   }, poly_name, meta_name)]
+  # How far the retained composition and the geometric one agree, comune by
+  # comune: with an official table this says whether the inference this
+  # project started from was right, and where it was not.
+  gsplit <- split(unique(geo$PRO_COM[!is.na(geo$PRO_COM)]),
+                  geo$URAU_CODE[!is.na(geo$PRO_COM)])
+  msplit <- split(unique(map$PRO_COM[!is.na(map$PRO_COM)]),
+                  map$URAU_CODE[!is.na(map$PRO_COM)])
+  pick_set <- function(l, cd) { v <- l[[cd]]; if (is.null(v)) character() else unique(v) }
+  chk[, n_comuni_geo := vapply(URAU_CODE, function(cd) length(pick_set(gsplit, cd)), 0L)]
+  chk[, shared_comuni := vapply(URAU_CODE, function(cd)
+    length(intersect(pick_set(gsplit, cd), pick_set(msplit, cd))), 0L)]
+  chk[, agreement := data.table::fifelse(
+    pmax(n_comuni, n_comuni_geo, na.rm = TRUE) > 0,
+    shared_comuni / pmax(n_comuni, n_comuni_geo, na.rm = TRUE), NA_real_)]
+
   # Population is the direct check of the geography; the deaths ratio also
   # depends on the death rates in Masselot's metadata (regional averages), so
   # a deaths mismatch with a matching population is not a wrong city.
@@ -228,8 +270,11 @@ finalize_crosswalk <- function(overlay, istat, erf, cfg, official = NULL) {
     default = "ok")]
   chk[, analysed := !status %in% c("no polygon contains the city point",
                                    "codes missing in Istat", "wrong city definition")]
+  src <- if (!use_official) "geometric matching (city point in GISCO polygons)" else {
+    s <- attr(official, "source")
+    if (is.null(s)) "official correspondence table" else s
+  }
   list(map = map[URAU_CODE %in% chk[analysed == TRUE, URAU_CODE] & in_istat],
        checks = chk[order(-pop)], candidates = cand[order(URAU_CODE, level)],
-       source = if (use_official) "Eurostat CITY-LAU correspondence table"
-                else "geometric matching (city point in GISCO polygons)")
+       map_geometry = geo, source = src)
 }
