@@ -49,6 +49,10 @@ cfg <- list(
   pop_ratio_ok    = c(0.85, 1.15),  # LAU population / Masselot population
   deaths_ratio_ok = c(0.80, 1.25),  # Istat deaths 20+ / deaths implied by metadata
   keep_flagged    = TRUE,           # analyse cities flagged only on population/name (never on deaths)
+  # region shown city by city, including cities below Masselot's death
+  # threshold (their curves are shrunk towards the pooled one by the BLUPs).
+  # Name as the Istat composition writes it; "" disables the section.
+  region_focus = "Lombardia",
 
   # ---- periods -------------------------------------------------------------
   test_start = as.Date("2023-01-01"),

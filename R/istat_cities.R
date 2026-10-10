@@ -178,38 +178,109 @@ read_istat_cities <- function(file) {
   out[]
 }
 
+#' Population of each comune, with a fallback on the name
+#'
+#' Comune codes are renumbered between releases: the 2021 composition carries
+#' the new Sardinian codes (Sassari `112050`, Cagliari `118006`), which the
+#' GISCO LAU layer does not have, and the population of those comuni would
+#' silently be missing. Codes absent from the layer are therefore matched on
+#' the normalised comune name, and only where that name occurs once in the
+#' whole layer.
+#'
+#' @param x data.table with `PRO_COM` and `comune`.
+#' @param pop data.table `PRO_COM`, `LAU_NAME`, `lau_pop`, or `NULL`.
+#' @return `x` with a `lau_pop` column.
+attach_lau_pop <- function(x, pop) {
+  if (is.null(pop) || !nrow(pop)) return(x[, lau_pop := NA_real_][])
+  p <- unique(data.table::as.data.table(pop)[, .(PRO_COM, LAU_NAME, lau_pop)])
+  x <- merge(x, unique(p[, .(PRO_COM, lau_pop)]), by = "PRO_COM", all.x = TRUE)
+  miss <- which(is.na(x$lau_pop))
+  if (length(miss)) {
+    uniq <- p[, .(n = .N, pop_byname = lau_pop[1]), by = .(key = norm_name(LAU_NAME))][n == 1L]
+    x[miss, lau_pop := uniq$pop_byname[match(norm_name(comune), uniq$key)]]
+    got <- sum(!is.na(x$lau_pop[miss]))
+    message("Population: ", length(miss), " comune codes absent from the LAU layer, ",
+            got, " recovered by name",
+            if (got < length(miss)) paste0(" (still missing: ",
+              paste(x$comune[miss][is.na(x$lau_pop[miss])], collapse = ", "), ")") else "")
+  }
+  x[]
+}
+
 #' City-comune map for the analysed cities, from the Istat composition
 #'
 #' The report carries Urban Audit codes, so Masselot's cities are matched on
-#' the six-character code stem (`IT001C` vs `IT001C1`), with no name matching
-#' and no choice of level: the report states whether a city is a City or a
-#' Greater City. GISCO is used only for the comune population, which the
-#' alignment checks need.
+#' the six-character code stem (`IT001C` vs `IT001C1`): no name matching and
+#' no inference about *which comuni* belong to a city.
+#'
+#' One thing the report cannot settle is which published *level* Masselot's
+#' figures describe. Under the regulation a code can denote both a City and a
+#' Greater City, and his metadata mixes the two: for Milan and Naples his
+#' population is the greater city, while for Bergamo, Caserta, Catania,
+#' Pescara, Acireale, Cagliari, Cosenza and Anzio it is the core comune
+#' alone. Summing the greater city there doubles both the population and the
+#' deaths, which is what made those cities fail the alignment check. Both
+#' levels are therefore built from the same official file - the full
+#' composition, and the comune bearing the city's name - and the one whose
+#' population matches the metadata is kept. The choice is unambiguous: the
+#' two ratios differ by a factor of about two.
 #'
 #' @param tab Output of [read_istat_cities()].
 #' @param metadata Country metadata from [read_erf_bundle()].
-#' @param pop data.table `PRO_COM`, `lau_pop` (from [read_lau_population()]),
-#'   or `NULL`.
+#' @param pop data.table `PRO_COM`, `LAU_NAME`, `lau_pop` (from
+#'   [read_lau_population()]), or `NULL`.
 #' @return data.table `URAU_CODE`, `level`, `PRO_COM`, `LAU_NAME`, `lau_pop`,
-#'   with the source in `attr(, "source")`.
+#'   with the source in `attr(, "source")` and both candidate levels, with
+#'   their population ratios, in `attr(, "candidates")`.
 istat_city_map <- function(tab, metadata, pop = NULL) {
   if (is.null(tab) || !nrow(tab)) return(NULL)
   x <- data.table::copy(tab)[, stem := urau_stem(city_code)]
-  meta <- data.table::data.table(URAU_CODE = metadata$URAU_CODE,
-                                 stem = urau_stem(metadata$URAU_CODE))
-  x <- merge(x, unique(meta), by = "stem", allow.cartesian = TRUE)
+  meta <- unique(data.table::data.table(
+    URAU_CODE = metadata$URAU_CODE, stem = urau_stem(metadata$URAU_CODE),
+    meta_pop = as.numeric(metadata$pop)))
+  x <- merge(x, meta, by = "stem", allow.cartesian = TRUE)
   if (!nrow(x))
     stop("No Urban Audit code of the Istat composition matches the metadata; ",
          "first codes in the file: ",
          paste(utils::head(unique(tab$city_code), 5), collapse = ", "), call. = FALSE)
-  x[, LAU_NAME := comune]
-  if (!is.null(pop) && nrow(pop)) {
-    p <- unique(data.table::as.data.table(pop)[, .(PRO_COM, lau_pop)])
-    x <- merge(x, p, by = "PRO_COM", all.x = TRUE)
-  } else x[, lau_pop := NA_real_]
-  out <- unique(x[, .(URAU_CODE, level = paste("Istat 2021:", level), PRO_COM,
-                      LAU_NAME, lau_pop)])
+  x <- attach_lau_pop(x, pop)
+
+  # The core comune is the one bearing the city's name (true for all 11 greater
+  # cities of the 2021 release); failing that, the most populous.
+  x[, is_core := {
+    hit <- norm_name(comune) == norm_name(city)
+    if (!any(hit)) {
+      p <- lau_pop
+      p[is.na(p)] <- -Inf
+      hit <- seq_len(.N) == which.max(p)
+    }
+    hit & cumsum(hit) == 1L          # exactly one core comune per city
+  }, by = URAU_CODE]
+  cand <- data.table::rbindlist(list(
+    data.table::copy(x)[, variant := "greater city"],
+    data.table::copy(x)[is_core == TRUE][, variant := "city"]))
+  # a single-comune city has one definition, not two
+  n_city <- x[, .N, by = URAU_CODE]
+  cand <- cand[!(URAU_CODE %in% n_city[N == 1L, URAU_CODE] & variant == "greater city")]
+
+  sc <- cand[, .(n_comuni = .N, lau_pop = sum(lau_pop, na.rm = TRUE),
+                 meta_pop = meta_pop[1]), by = .(URAU_CODE, variant)]
+  sc[, pop_ratio := lau_pop / meta_pop]
+  # without a usable population the official full composition is kept
+  sc[, score := data.table::fifelse(is.finite(pop_ratio) & pop_ratio > 0,
+                                    abs(log(pop_ratio)),
+                                    data.table::fifelse(variant == "greater city", 0, 1))]
+  best <- sc[order(URAU_CODE, score), .SD[1L], by = URAU_CODE][, .(URAU_CODE, variant)]
+  out <- merge(cand, best, by = c("URAU_CODE", "variant"))
+  out <- unique(out[, .(URAU_CODE, level = paste("Istat 2021:", variant), PRO_COM,
+                        LAU_NAME = comune, lau_pop)])
+  nd <- best[variant == "city"][URAU_CODE %in% n_city[N > 1L, URAU_CODE]]
+  if (nrow(nd))
+    message("Level chosen on population: core comune rather than greater city for ",
+            nrow(nd), " cities (", paste(nd$URAU_CODE, collapse = ", "), ")")
   attr(out, "source") <- attr(tab, "source")
+  attr(out, "candidates") <- merge(
+    sc, unique(x[, .(URAU_CODE, city)]), by = "URAU_CODE")[order(-meta_pop, variant)]
   out[order(URAU_CODE, PRO_COM)]
 }
 

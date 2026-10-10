@@ -80,12 +80,20 @@ fit_stage1 <- function(dat, start, end, spec, cfg) {
 #' @param erf Output of [read_erf_bundle()].
 #' @param start,end Period.
 #' @param cfg Configuration list.
+#' @param only Restrict to these Urban Audit codes (`NULL` = all).
+#' @param age_series Also fit the merged age groups. `FALSE` keeps only the
+#'   overall series (deaths 20+), which is what the second stage pools.
+#' @param min_fit_deaths Deaths below which the overall series is not fitted;
+#'   defaults to Masselot's threshold. Set to 0 to fit a city whatever its
+#'   size, leaving the shrinkage to the BLUPs of [blup_curves()].
 #' @return List with `results` (one row per city x series) and `bands`
 #'   (curves on a temperature grid, for plots).
-run_curve_tests <- function(mort, expo, erf, start, end, cfg) {
+run_curve_tests <- function(mort, expo, erf, start, end, cfg, only = NULL,
+                            age_series = TRUE, min_fit_deaths = cfg$min_deaths) {
   set.seed(cfg$seed)
   res <- list(); bands <- list(); fits <- list()
   codes <- intersect(unique(mort$URAU_CODE), unique(expo$URAU_CODE))
+  if (!is.null(only)) codes <- intersect(codes, only)
   for (cd in codes) {
     spec <- erf_spec(erf, cd, cfg)
     ex <- expo[URAU_CODE == cd & date >= start - cfg$lag_max & date <= end, .(date, tmean)]
@@ -93,7 +101,7 @@ run_curve_tests <- function(mort, expo, erf, start, end, cfg) {
     tot <- m[, .(d = sum(deaths)), by = agegroup][match(AGE_GROUPS, agegroup), d]
     tot[is.na(tot)] <- 0
     series <- list(list(level = "all20", ages = AGE_GROUPS))
-    if (sum(tot) >= cfg$min_deaths) {
+    if (isTRUE(age_series) && sum(tot) >= cfg$min_deaths) {
       bins <- cumsum_binning(tot, cfg$min_deaths)
       if (length(unique(bins)) > 1)
         series <- c(series, lapply(unique(bins), function(b)
@@ -107,7 +115,7 @@ run_curve_tests <- function(mort, expo, erf, start, end, cfg) {
       row <- data.table::data.table(URAU_CODE = cd, level = s$level, series = lab,
                                     n_ages = length(s$ages), deaths = td,
                                     below_threshold = td < cfg$min_deaths)
-      if (td < cfg$min_deaths && s$level == "all20") {
+      if (td < min_fit_deaths && s$level == "all20") {
         res[[length(res) + 1]] <- cbind(row, status = "not fitted (deaths below threshold)")
         next
       }
@@ -147,7 +155,8 @@ run_curve_tests <- function(mort, expo, erf, start, end, cfg) {
         wald = wald, wald_p = wald_p)
       fits[[length(fits) + 1]] <- list(URAU_CODE = cd, level = s$level, series = lab,
                                        ages = s$ages, w = pmax(w, 1), coef = fit$coef,
-                                       vcov = fit$vcov,
+                                       vcov = fit$vcov, deaths = td,
+                                       below_threshold = td < cfg$min_deaths,
                                        trange = stats::quantile(per$tmean, c(.005, .995)))
       grid <- curve_grid(spec, per$tmean)
       bands[[length(bands) + 1]] <- rbind(
@@ -193,20 +202,39 @@ curve_grid <- function(spec, temps) {
 #' (meta-regression on the published coefficients is not needed: the
 #' comparison is done on the relative-risk scale).
 #'
+#' Cities whose own series is too short or too small to carry a curve on its
+#' own are handled by the same machinery: including their noisy fit in the
+#' meta-analysis gives it a large variance, so its BLUP sits close to the
+#' pooled curve and the city borrows strength from the rest of the country.
+#' Pass such fits through `extra_fits`.
+#'
 #' @param tests Output of [run_curve_tests()].
 #' @param erf Output of [read_erf_bundle()].
 #' @param cfg Configuration list.
+#' @param extra_fits Further first-stage fits to pool, in the format of
+#'   `tests$fits` (e.g. cities fitted below Masselot's death threshold). A
+#'   city already in `tests` is not added twice.
+#' @param keep Return results only for these Urban Audit codes (`NULL` = all
+#'   pooled cities). The pooling itself always uses every fit.
 #' @return List with `results` (BLUP RR99 vs published, by city) and `bands`.
-blup_curves <- function(tests, erf, cfg) {
+blup_curves <- function(tests, erf, cfg, extra_fits = NULL, keep = NULL) {
   set.seed(cfg$seed)
   f <- Filter(function(x) x$level == "all20", tests$fits)
+  if (length(extra_fits)) {
+    have <- vapply(f, `[[`, "", "URAU_CODE")
+    add <- Filter(function(x) identical(x$level, "all20") && !x$URAU_CODE %in% have,
+                  extra_fits)
+    f <- c(f, add)
+  }
   if (length(f) < 3) return(NULL)
   Y <- do.call(rbind, lapply(f, `[[`, "coef"))
   S <- lapply(f, `[[`, "vcov")
   mm <- mixmeta::mixmeta(Y, S, method = "reml")
   bl <- mixmeta::blup(mm, vcov = TRUE)
   res <- list(); bands <- list()
-  for (i in seq_along(f)) {
+  want <- if (is.null(keep)) seq_along(f) else
+    which(vapply(f, `[[`, "", "URAU_CODE") %in% keep)
+  for (i in want) {
     cd <- f[[i]]$URAU_CODE; spec <- erf_spec(erf, cd, cfg)
     b <- bl[[i]]$blup; V <- bl[[i]]$vcov
     new <- curve_single(spec, b, rmvn(cfg$nsim, b, V))
@@ -217,12 +245,25 @@ blup_curves <- function(tests, erf, cfg) {
     fp <- curve_eval(pub, pts); fpd <- curve_eval(pub, pts, draws = TRUE)
     d <- (fn[1] - fn[2]) - (fp[1] - fp[2])
     se <- sqrt(stats::var(fnd[, 1] - fnd[, 2]) + stats::var(fpd[, 1] - fpd[, 2]))
-    res[[i]] <- data.table::data.table(URAU_CODE = cd, rr99_pub = exp(fp[1] - fp[2]),
-                                       rr99_blup = exp(fn[1] - fn[2]), d_lr99 = d, se_d_lr99 = se)
+    # the city's own curve, before shrinkage, for comparison
+    own <- curve_single(spec, f[[i]]$coef, rmvn(cfg$nsim, f[[i]]$coef, f[[i]]$vcov))
+    fo <- curve_eval(own, pts); fod <- curve_eval(own, pts, draws = TRUE)
+    qo <- stats::quantile(fod[, 1] - fod[, 2], c(.025, .975))
+    qb <- stats::quantile(fnd[, 1] - fnd[, 2], c(.025, .975))
+    res[[i]] <- data.table::data.table(
+      URAU_CODE = cd,
+      deaths = if (is.null(f[[i]]$deaths)) NA_real_ else as.numeric(f[[i]]$deaths),
+      below_threshold = isTRUE(f[[i]]$below_threshold),
+      rr99_pub = exp(fp[1] - fp[2]),
+      rr99_own = exp(fo[1] - fo[2]), rr99_own_lo = exp(qo[1]), rr99_own_hi = exp(qo[2]),
+      rr99_blup = exp(fn[1] - fn[2]), rr99_blup_lo = exp(qb[1]), rr99_blup_hi = exp(qb[2]),
+      d_lr99 = d, se_d_lr99 = se)
     grid <- seq(f[[i]]$trange[1], f[[i]]$trange[2], length.out = 80)
     grid <- grid[grid >= spec$pct(0) & grid <= spec$pct(100)]
-    bands[[i]] <- rbind(cbind(URAU_CODE = cd, curve = "Published", curve_band(pub, grid)),
-                        cbind(URAU_CODE = cd, curve = "Refitted (BLUP)", curve_band(new, grid)))
+    bands[[i]] <- rbind(
+      cbind(URAU_CODE = cd, curve = "Published", curve_band(pub, grid)),
+      cbind(URAU_CODE = cd, curve = "Refitted (city only)", curve_band(own, grid)),
+      cbind(URAU_CODE = cd, curve = "Refitted (BLUP)", curve_band(new, grid)))
   }
   out <- merge(data.table::rbindlist(res), erf$metadata[, .(URAU_CODE, name, inmcc)],
                by = "URAU_CODE")

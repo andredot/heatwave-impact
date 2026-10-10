@@ -122,11 +122,37 @@ Urban Audit code and the comuni that compose it, with their Istat codes:
 `r data.table::uniqueN(tar_read(istat_cities)[level == "greater city", city_code])`
 greater cities. Those are exactly the two keys this analysis needs — the
 Urban Audit code of Masselot's curves and the comune code of the Istat
-mortality file — so the crosswalk involves no name matching and no
-inference. Codes are matched on the six-character stem, since releases
-differ in the trailing version digit (`IT001C` vs `IT001C1`). The file is
-shipped with the repository (`r basename(tar_read(istat_cities_file))`), so
-a fresh run reproduces the geography without a download.
+mortality file — so which comuni make up a city is no longer inferred.
+Codes are matched on the six-character stem, since releases differ in the
+trailing version digit (`IT001C` vs `IT001C1`). The file is shipped with the
+repository (`r basename(tar_read(istat_cities_file))`), so a fresh run
+reproduces the geography without a download.
+
+One thing the report cannot settle is which published *level* Masselot's
+figures describe. Under the regulation the same code denotes a City and,
+where one exists, a Greater City, and his metadata mixes the two: for Milan
+and Naples his population is the greater city, while for the eight other
+greater cities it is the core comune alone. Summing the greater city there
+roughly doubles both the population and the deaths — which is exactly what
+the alignment check caught, since the two ratios moved together. Both levels
+are therefore built from the same official file (the full composition, and
+the comune bearing the city's name) and the one whose population matches the
+metadata is kept. The table below shows the choice is not a close call.
+
+```{r crosswalk-levels}
+cnd <- attr(tar_read(istat_map), "candidates")
+if (!is.null(cnd)) {
+  w <- data.table::dcast(cnd[, .(city, variant, pop_ratio)], city ~ variant,
+                         value.var = "pop_ratio")
+  w <- w[!is.na(`greater city`)]
+  data.table::setnames(w, c("City", "Core comune", "Greater city"))
+  w[, Kept := data.table::fifelse(abs(log(`Core comune`)) <
+                                    abs(log(`Greater city`)), "core comune", "greater city")]
+  kbl(w[order(Kept, City), .(City, `Core comune` = fmt(`Core comune`),
+                             `Greater city` = fmt(`Greater city`), Kept)],
+      caption = "Population of each candidate level / population in Masselot's metadata")
+}
+```
 
 The geographic matching this project started from is still computed as a
 check: each city's Urban Audit point (from Masselot's metadata) is located
@@ -204,15 +230,28 @@ fl <- ck[status != "ok", .(City = name, Polygon = poly_name, Level = level, Stat
 if (nrow(fl)) kbl(fl, caption = "Cities to inspect (a level or comuni can be forced in data/raw/crosswalk_overrides.csv)") else cat("All cities passed the checks.")
 ```
 
-The population ratios now cluster between 0.9 and 1.1: the comuni we sum are
-the population Masselot's curves describe. Five cities keep a deaths ratio
-outside the accepted band while their population matches (Padova, Treviso,
-Gela, Cerignola, Altamura); since the population is right, this reflects the
-regional death rates in his metadata rather than a wrong city, and they stay
-in the analysis with the flag. Anzio is retained with a population flag.
-Cagliari and Sassari are dropped: comune codes in their definition are absent
-from the Istat file, most likely because of code changes in Sardinia, and a
-city with missing comuni would carry too few deaths.
+```{r crosswalk-outcome}
+#| output: asis
+nok  <- ck[status == "ok", .N]
+ndth <- ck[status == "deaths differ from metadata rates", .N]
+npop <- ck[status == "check population", .N]
+nout <- ck[analysed == FALSE]
+cat(sprintf(paste0("Of the %d cities in Masselot's Italian metadata, %d are carried into ",
+                   "the analysis: %d pass every check, %d keep a deaths ratio outside the ",
+                   "accepted band while their population matches (the regional death rates ",
+                   "in his metadata, not a wrong city, so they stay with the flag) and %d ",
+                   "are flagged on population only.\n\n"),
+            nrow(ck), ck[analysed == TRUE, .N], nok, ndth, npop))
+if (nrow(nout))
+  cat(sprintf("Excluded: %s.\n\n",
+              paste(sprintf("%s (%s)", nout$name, nout$status), collapse = "; ")))
+```
+
+The population ratios cluster between 0.9 and 1.1: the comuni we sum are the
+population Masselot's curves describe. Massa is the one city of his metadata
+with no composition to match: `IT045C` is a City in the earlier Urban Audit
+releases and not one in 2021, so neither the Istat report nor the 2021
+polygons contain it. Its curve is published but cannot be tested here.
 
 ## Age groups
 
@@ -421,7 +460,8 @@ other cities in proportion to its own imprecision.
 bt <- tar_read(blup_test)
 if (!is.null(bt)) {
   top <- ct$results[level == "all20" & status == "fitted"][order(-deaths)][1:min(12, .N), URAU_CODE]
-  b <- merge(bt$bands[URAU_CODE %in% top], tar_read(cities)[, .(URAU_CODE, name)], by = "URAU_CODE")
+  b <- merge(bt$bands[URAU_CODE %in% top & curve != "Refitted (city only)"],
+             tar_read(cities)[, .(URAU_CODE, name)], by = "URAU_CODE")
   ggplot(b, aes(t, rr, colour = curve, fill = curve)) + geom_hline(yintercept = 1, colour = "grey60") +
     geom_ribbon(aes(ymin = lo, ymax = hi), alpha = .15, colour = NA) + geom_line(linewidth = .8) +
     facet_wrap(~ name, scales = "free_x") + coord_cartesian(ylim = c(.8, 2.5)) +
@@ -527,6 +567,70 @@ if (nrow(cp$pooled)) {
 The ratio falls in every step, and the trend is significant. Two of the three
 windows use Masselot's own temperatures, so the decline cannot be an artefact
 of our exposure series.
+
+# One region in full: `r cfg$region_focus`
+
+Everything above tests the cities that carry enough deaths for Masselot's
+first stage: 5,000 over the period. An operational system needs a curve for
+*every* city of the region it covers, small ones included, and the second
+stage is what makes that possible. A city whose own fit is noisy enters the
+multivariate random-effects meta-analysis with a large variance, so its best
+linear unbiased prediction sits close to the pooled Italian curve: it
+contributes what its own data support and borrows the rest. The pooling here
+uses every Italian city fitted in the test period, not only the region's, and
+the first stage is the same model with the same knots — only the death
+threshold is lifted.
+
+```{r region-table}
+rt <- tar_read(region_table)
+if (is.null(rt) || !nrow(rt)) cat("No city of this region is in the analysis.\n") else {
+  tb <- rt[, .(City = name,
+               `Deaths 20+ in the period` = fmt(deaths, 0),
+               `Own fit` = fifelse(is.na(deaths), "-",
+                 fifelse(below_threshold, "below threshold", "above threshold")),
+               `RR99 published` = fmt(rr99_pub, 3),
+               `RR99 own fit` = sprintf("%s (%s-%s)", fmt(rr99_own, 2),
+                                        fmt(rr99_own_lo, 2), fmt(rr99_own_hi, 2)),
+               `RR99 BLUP` = sprintf("%s (%s-%s)", fmt(rr99_blup, 2),
+                                     fmt(rr99_blup_lo, 2), fmt(rr99_blup_hi, 2)),
+               MCC = fifelse(inmcc, "yes", "no"))]
+  kbl(tb, caption = sprintf(paste("Heat relative risk at the 99th percentile vs the published",
+                                  "MMT, %s, %s"), cfg$region_focus, periods$test$label))
+}
+```
+
+The interval on the own fit against the interval on the BLUP is the shrinkage
+made visible: where a city has few deaths the first widens and the second
+stays narrow and close to the regional average, which is the behaviour that
+lets the curve be used at all.
+
+```{r region-curves, fig.height=7}
+bl <- tar_read(blup_region)
+if (!is.null(bl) && nrow(bl$bands)) {
+  bb <- merge(bl$bands, tar_read(cities)[, .(URAU_CODE, name)], by = "URAU_CODE")
+  bb[, curve := factor(curve, c("Published", "Refitted (city only)", "Refitted (BLUP)"))]
+  print(ggplot(bb, aes(t, rr, colour = curve, fill = curve)) +
+    geom_hline(yintercept = 1, colour = "grey60", linewidth = .3) +
+    geom_ribbon(aes(ymin = lo, ymax = hi), alpha = .12, colour = NA) +
+    geom_line(linewidth = .6) +
+    facet_wrap(~ name, scales = "free", ncol = 3) +
+    scale_y_log10() +
+    scale_colour_manual(values = c("Published" = "grey25",
+                                   "Refitted (city only)" = "#C2492E",
+                                   "Refitted (BLUP)" = "#2C6E9B"), aesthetics = c("colour", "fill")) +
+    labs(x = "Daily mean temperature (°C)", y = "Relative risk", colour = NULL, fill = NULL,
+         title = sprintf("%s: exposure-response curves, every city", cfg$region_focus),
+         subtitle = sprintf("Refitted on %s; BLUP shrinks each city towards the pooled Italian curve",
+                            periods$test$label)) +
+    theme(legend.position = "top"))
+}
+```
+
+```{r region-notfitted}
+if (!is.null(rt) && nrow(rt[status != "fitted"]))
+  kbl(rt[status != "fitted", .(City = name, Status = status)],
+      caption = "Cities of the region without a refitted curve")
+```
 
 # Test B: observed vs predicted heat deaths
 

@@ -127,3 +127,32 @@ Notes:
   ratio plot cannot, and those are what demonstrate the noise is symmetric;
 - consider a signed square-root (or asinh) scale on the current scatter as a
   separate improvement: it decompresses the crowd near zero while keeping negatives.
+
+## 6. Curves for every city of a region (BLUPs), and then for the app
+Status: PARTLY DONE (branch istat-city-composition). The report has a section
+"One region in full" driven by `cfg$region_focus` (default Lombardia): every city
+of the region is refitted with Masselot's first stage with the death threshold
+lifted (`run_curve_tests(..., min_fit_deaths = 0)`), and the shrinkage is left to
+the second stage - `blup_curves(..., extra_fits = , keep = )` pools the city with
+every Italian fit, so a noisy city gets a large variance and its BLUP sits close
+to the pooled curve. The table reports the published, own-fit and BLUP relative
+risks with intervals, and the figure shows the three curves per city; Lombardy
+resolves to nine cities (Bergamo, Brescia, Como, Cremona, Lecco, Milano, Pavia,
+Varese, Vigevano).
+
+Still to do:
+- carry the BLUP curves into the app bundle, so the small cities are usable
+  operationally and not only visible in the report. Today `app_export.R` exports
+  the published and recalibrated curve sets; the regional BLUP set would be a
+  third option in the curve selector.
+- validate the transfer rather than assume it: leave-one-city-out, refit the
+  meta-analysis without a city, predict its curve from the others and compare with
+  its own fit. That is the honest test of whether a curve can be lent to a city
+  that has too few deaths of its own.
+- decide the period the operational BLUP curves are fitted on. The report uses the
+  test period, which is the right choice for validating; 2016-2019 is what restored
+  calibration out of sample, so it is probably the right choice for forecasting.
+- Massa (`IT045C`) has a published curve and no composition: it is a City in the
+  earlier Urban Audit releases and not one in 2021. It could be added by hand
+  (one comune) through `data/raw/crosswalk_overrides.csv` if the city matters, but
+  the override path currently needs the city to have a candidate polygon too.

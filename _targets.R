@@ -96,6 +96,19 @@ list(
   tar_target(pooled_repro, if (config$run_reproduction) pool_curve_differences(curves_repro)),
   tar_target(blup_repro, if (config$run_reproduction) blup_curves(curves_repro, erf, config)),
 
+  # ---- 2B. one region in full (every city, small ones shrunk by the BLUPs) --
+  tar_target(region_codes, region_city_codes(istat_cities, crosswalk$map,
+                                             config$region_focus)),
+  tar_target(curves_region, if (length(region_codes))
+    run_curve_tests(mort, exposure_test, erf, periods$test$start, periods$test$end,
+                    config, only = region_codes, age_series = FALSE, min_fit_deaths = 0)),
+  # the pooling uses every Italian fit, so a small city borrows strength
+  tar_target(blup_region, if (length(region_codes))
+    blup_curves(curves_test, erf, config, extra_fits = curves_region$fits,
+                keep = region_codes)),
+  tar_target(region_table, if (length(region_codes))
+    region_curve_table(blup_region, curves_region, erf$metadata)),
+
   tar_target(curves_periods, run_period_tests(mort, era5_masselot, exposure_test, erf,
                                               data_end, config)),
 
