@@ -153,7 +153,7 @@ list(
                                          forecasts, era5_test, data_end, config,
                                          "app/app_data.rds",
                                          flumomo_results, flumomo_cities, istat_file,
-                                         mort),
+                                         mort, istat_cities),
              format = "file"),
 
   # ---- report ---------------------------------------------------------------
