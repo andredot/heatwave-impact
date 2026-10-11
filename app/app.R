@@ -1,21 +1,20 @@
 # =============================================================================
-#  Decessi attribuibili al caldo - citta' italiane
+#  Heat-attributable deaths - Italian cities
 #  ---------------------------------------------------------------------------
-#  Fonti della temperatura:
-#    - Previsione: Open-Meteo, dal giorno scelto in avanti. Con la "macchina
-#      del tempo" si puo' scegliere una data passata: in quel caso vengono
-#      usate le previsioni realmente emesse allora (archivio delle emissioni
-#      precedenti, fino a 7 giorni di anticipo).
-#    - Ricostruzione ERA5-Land: temperature osservate fra due date.
+#  Temperature sources:
+#    - Forecast: Open-Meteo, from the chosen day onwards. The "time machine"
+#      accepts a past date: the forecasts actually issued that day are then
+#      used (previous-runs archive, up to 7 days ahead).
+#    - ERA5-Land reconstruction: temperatures observed between two dates.
 #
-#  Curve esposizione-risposta: quelle pubblicate (Masselot et al. 2023) e
-#  quelle ricalibrate sui dati italiani recenti. Le stime hanno un intervallo
-#  al 95% che combina l'incertezza della curva e quella del livello atteso.
+#  Exposure-response curves: the published ones (Masselot et al. 2023) and
+#  those recalibrated on recent Italian data. Estimates carry a 95% interval
+#  combining the uncertainty of the curve and of the expected level.
 #
-#  Scheda EuroMOMO: decessi osservati con due attese indipendenti, la nostra e
-#  quella del codice ufficiale FluMOMO, per la regione o per le sue citta'.
+#  EuroMOMO tab: observed deaths against two independent expectations, this
+#  project's and the official FluMOMO code's, for the region or its cities.
 #
-#  Dati precalcolati in app_data.rds (targets::tar_make()).
+#  Precomputed data in app_data.rds (targets::tar_make()).
 # =============================================================================
 library(shiny)
 library(data.table)
@@ -43,25 +42,26 @@ for (col in c("tmean", "logrr", "mmt")) if (!col %in% names(DAILY)) DAILY[, (col
 HAS_VCOV <- !is.null(BUNDLE$curves[[1]]$published[[1]]$vcov)
 HAS_BSD  <- any(DAILY$B_logsd > 0, na.rm = TRUE)
 BUNDLE_INFO <- sprintf(
-  "app_data.rds: %s, creato il %s | covarianze curve: %s | incertezza baseline: %s | FluMOMO: %s",
+  "app_data.rds: %s, built %s | curve covariances: %s | baseline uncertainty: %s | FluMOMO: %s",
   normalizePath("app_data.rds"), format(BUNDLE$built %||% NA),
-  if (HAS_VCOV) "s\u00ec" else "NO", if (HAS_BSD) "s\u00ec" else "NO",
-  if (!is.null(BUNDLE$flumomo)) "s\u00ec" else "NO")
+  if (HAS_VCOV) "yes" else "NO", if (HAS_BSD) "yes" else "NO",
+  if (!is.null(BUNDLE$flumomo)) "yes" else "NO")
 message(BUNDLE_INFO)
 if (!HAS_VCOV || !HAS_BSD)
-  message("Senza questi campi gli intervalli non possono essere calcolati: ",
-          "rieseguire targets::tar_make() con la versione aggiornata di R/app_export.R ",
-          "e copiare il file prodotto accanto ad app.R.")
+  message("Without these fields the intervals cannot be computed: re-run ",
+          "targets::tar_make() with the current R/app_export.R and copy the file ",
+          "it produces next to app.R.")
 REGIONI <- sort(unique(CITIES$region))
 NSIM <- 400
-FC_MAX_LEAD <- 7      # lead massimo nell'archivio delle emissioni precedenti
-PUB <- "Pubblicate (Masselot 2023)"
+FC_MAX_LEAD <- 7      # longest lead in the previous-runs archive
+PUB <- "Published (Masselot 2023)"
 COL <- c("#B2182B", "#1B7837", "#762A83", "#B35806")
 
-it_label <- function(x) sub("^Italian curves", "Curve italiane", x)
-pct_fmt <- function(p) if (is.na(p)) "n.d." else sprintf("%.0f%%", 100 * p)
+# curve sets already carry English names in the bundle
+it_label <- function(x) x
+pct_fmt <- function(p) if (is.na(p)) "n/a" else sprintf("%.0f%%", 100 * p)
 
-# ---- utilita' numeriche -----------------------------------------------------
+# ---- numerical helpers ------------------------------------------------------
 basis <- function(t, spec) {
   suppressWarnings(unclass(splines::bs(t, knots = spec$knots, degree = spec$degree,
                                        Boundary.knots = spec$bound)))
@@ -114,7 +114,7 @@ get_json <- function(url, tries = 3, wait = 3) {
   if (!is.null(hit)) return(hit)
   readers <- list(
     curl = function(u) {
-      if (!requireNamespace("curl", quietly = TRUE)) stop("curl non installato")
+      if (!requireNamespace("curl", quietly = TRUE)) stop("the curl package is not installed")
       h <- curl::new_handle(connecttimeout = 20L, timeout = 180L)
       r <- curl::curl_fetch_memory(u, handle = h)
       if (r$status_code >= 400L) stop("HTTP ", r$status_code)
@@ -141,10 +141,10 @@ get_json <- function(url, tries = 3, wait = 3) {
     }
     Sys.sleep(wait * i)
   }
-  stop("Open-Meteo non raggiungibile dopo ", tries, " tentativi con tre metodi ",
-       "diversi (ultimo errore — ", last, "). Se l'errore è \"SSL connect ",
-       "error\", di solito si tratta della connessione o di un proxy: riprovare ",
-       "fra qualche minuto.")
+  stop("Open-Meteo could not be reached after ", tries, " rounds over three ",
+       "different transports (last error: ", last, "). An \"SSL connect error\" ",
+       "here is usually the connection or a proxy rather than the site: try ",
+       "again in a few minutes.")
 }
 
 # ---- temperature ------------------------------------------------------------
@@ -263,7 +263,7 @@ city_attributable <- function(code, temps, curve_name, nsim) {
        observed = base[, .(obs = sum(obs)), by = date][match(temps$date, date), obs])
 }
 
-# ---- scenari ----------------------------------------------------------------
+# ---- scenarios --------------------------------------------------------------
 #' Probability that a heatwave starts within the horizon
 #'
 #' A day counts as hot when the temperature reaches the city's heatwave
@@ -330,14 +330,14 @@ scenario_table <- function(codes, temps_by_city, curve_name, blocks = c(5, 5), n
     }
   }
   q <- function(x) stats::quantile(x, c(.025, .975))
-  rows <- list(data.table(scenario = "Previsione attuale", giorni = nrow(temps_by_city[[codes[1]]]),
+  rows <- list(data.table(scenario = "Current forecast", giorni = nrow(temps_by_city[[codes[1]]]),
                           stima = point, lo = q(draws)[1], hi = q(draws)[2]))
   cum_p <- point; cum_d <- draws; extra <- 0
   for (b in blocks) {
     extra <- extra + b
     cum_p <- cum_p + b * peak_point; cum_d <- cum_d + b * peak_draws
     rows[[length(rows) + 1]] <- data.table(
-      scenario = sprintf("Se prosegue altri %d giorni", extra),
+      scenario = sprintf("If the heat lasts %d more days", extra),
       giorni = nrow(temps_by_city[[codes[1]]]) + extra,
       stima = cum_p, lo = q(cum_d)[1], hi = q(cum_d)[2])
   }
@@ -389,8 +389,8 @@ scenario_paths <- function(codes, as_of, horizon, curve_name, debias,
   zero <- function(scen, date0) data.table(date = date0, scenario = scen,
                                            cum = 0, lo = 0, hi = 0)
   cum_fc <- t(apply(acc_fc$draws, 1, cumsum))
-  paths <- list(rbind(zero("Previsione", as_of),
-                      cbind(data.table(date = acc_fc$dates, scenario = "Previsione"),
+  paths <- list(rbind(zero("Forecast", as_of),
+                      cbind(data.table(date = acc_fc$dates, scenario = "Forecast"),
                             q(cum_fc))))
   end <- cum_fc[, ncol(cum_fc)]; last <- max(acc_fc$dates); extra <- 0
   if (!is.null(peak)) for (b in blocks) {
@@ -398,7 +398,7 @@ scenario_paths <- function(codes, as_of, horizon, curve_name, debias,
     m <- sapply(days, function(k) end + k * peak)
     if (is.null(dim(m))) m <- matrix(m, nrow = length(end))
     extra <- extra + b
-    scen <- sprintf("Se prosegue (+%d giorni)", extra)
+    scen <- sprintf("If it lasts (+%d days)", extra)
     # each branch starts where the previous path ended, so the lines join up
     paths[[length(paths) + 1]] <- rbind(
       cbind(data.table(date = last, scenario = scen), q(matrix(end, ncol = 1))),
@@ -594,41 +594,40 @@ ui <- fluidPage(
     .sottotitolo { color: #666; margin-bottom: 1rem; }
     .errore { color: #B00020; font-weight: 600; }
     .nota { color: #666; font-size: .85rem; }"))),
-  div(class = "titolo", "Decessi attribuibili al caldo \u2014 citt\u00e0 italiane"),
+  div(class = "titolo", "Heat-attributable deaths \u2014 Italian cities"),
   div(class = "sottotitolo",
-      "Curve di Masselot et al. (2023) e loro ricalibrazione sui dati italiani recenti."),
+      "Masselot et al. (2023) curves and their recalibration on recent Italian data."),
   tabsetPanel(
     id = "scheda",
     tabPanel(
-      "Caldo",
+      "Heat",
       br(),
       sidebarLayout(
         sidebarPanel(
           width = 3,
-          dateRangeInput("periodo", "Periodo mostrato",
+          dateRangeInput("periodo", "Period shown",
                          start = Sys.Date() - 60, end = Sys.Date() + 7,
-                         max = Sys.Date() + 16, format = "dd/mm/yyyy", language = "it",
+                         max = Sys.Date() + 16, format = "dd/mm/yyyy",
                          separator = " \u2013 "),
-          dateInput("asof", "Data di emissione (macchina del tempo)",
-                    value = Sys.Date(), max = Sys.Date(), format = "dd/mm/yyyy",
-                    language = "it"),
+          dateInput("asof", "Issue date (time machine)",
+                    value = Sys.Date(), max = Sys.Date(), format = "dd/mm/yyyy"),
           div(class = "nota",
-              "Prima di questa data le temperature vengono da ERA5-Land, dopo dalle",
-              "previsioni emesse allora (al massimo 7 giorni di anticipo se la data",
-              "\u00e8 nel passato, 16 se \u00e8 oggi)."),
-          checkboxInput("debias", "Correggi la distorsione delle previsioni", TRUE),
+              "Before this date temperatures come from ERA5-Land, after it from the",
+              "forecasts issued that day (at most 7 days ahead for a past date,",
+              "16 for today)."),
+          checkboxInput("debias", "Correct the forecast bias", TRUE),
           hr(),
-          radioButtons("ambito", "Ambito", c("Regione" = "reg", "Singola citt\u00e0" = "city")),
+          radioButtons("ambito", "Scope", c("Region" = "reg", "Single city" = "city")),
           conditionalPanel("input.ambito == 'reg'",
-                           selectInput("regione", "Regione", choices = REGIONI,
+                           selectInput("regione", "Region", choices = REGIONI,
                                        selected = if ("Lombardia" %in% REGIONI) "Lombardia"
                                        else REGIONI[1])),
           conditionalPanel("input.ambito == 'city'",
-                           selectInput("citta", "Citt\u00e0", choices = sort(CITIES$name))),
-          checkboxGroupInput("curve", "Curve", choices = NULL),
-          div(class = "nota", "Gli scenari usano la prima curva selezionata."),
+                           selectInput("citta", "City", choices = sort(CITIES$name))),
+          checkboxGroupInput("curve", "Curves", choices = NULL),
+          div(class = "nota", "The scenarios use the first curve set selected."),
           br(),
-          actionButton("vai", "Calcola", class = "btn-primary"),
+          actionButton("vai", "Compute", class = "btn-primary"),
           br(), br(), uiOutput("msg"), div(class = "nota", textOutput("copertura")),
           br(), div(class = "nota", style = "word-break:break-all;", textOutput("bundle"))
         ),
@@ -636,12 +635,12 @@ ui <- fluidPage(
           width = 9,
           tabsetPanel(
             id = "uscite",
-            tabPanel("Sintesi", br(), uiOutput("sintesi"),
+            tabPanel("Summary", br(), uiOutput("sintesi"),
                      plotOutput("g_giorno", height = "460px"), br(),
                      tableOutput("tab")),
-            tabPanel("Scenari", br(), htmlOutput("sc_testo"), br(),
+            tabPanel("Scenarios", br(), htmlOutput("sc_testo"), br(),
                      uiOutput("sc_vista"), br(), tableOutput("sc_tab")),
-            tabPanel("Dettagli", br(),
+            tabPanel("Details", br(),
                      plotOutput("g_cum", height = "360px"), br(),
                      plotOutput("g_temp", height = "320px"), br(),
                      plotOutput("g_mappa", height = "460px"))
@@ -655,19 +654,19 @@ ui <- fluidPage(
       sidebarLayout(
         sidebarPanel(
           width = 3,
-          radioButtons("mm_ambito", "Popolazione",
-                       c("Intera regione (tutti i comuni)" = "reg",
-                         "Citt\u00e0 validate della regione" = "cit")),
-          dateRangeInput("mm_periodo", "Periodo",
+          radioButtons("mm_ambito", "Population",
+                       c("Whole region (all municipalities)" = "reg",
+                         "Validated cities of the region" = "cit")),
+          dateRangeInput("mm_periodo", "Period",
                          start = as.Date(format(BUNDLE$data_end, "%Y-01-01")),
-                         end = BUNDLE$data_end, format = "dd/mm/yyyy", language = "it",
+                         end = BUNDLE$data_end, format = "dd/mm/yyyy",
                          separator = " \u2013 "),
-          radioButtons("mm_riferimento", "Attesa di riferimento (area colorata)",
-                       c("FluMOMO" = "flu", "Modello del progetto" = "our")),
+          radioButtons("mm_riferimento", "Reference expectation (shaded area)",
+                       c("FluMOMO" = "flu", "This project's model" = "our")),
           div(class = "nota",
-              "Due attese indipendenti: il modello del progetto (giornaliero, et\u00e0 20+,",
-              "senza caldo) e il codice ufficiale FluMOMO (settimanale, senza temperature",
-              "estreme, influenza inclusa).")
+              "Two independent expectations: this project's model (daily, ages 20+,",
+              "without heat) and the official FluMOMO code (weekly, without extreme",
+              "temperatures, influenza included).")
         ),
         mainPanel(width = 9, plotOutput("g_momo", height = "600px"),
                   br(), tableOutput("tab_momo"))
@@ -692,19 +691,19 @@ server <- function(input, output, session) {
 
   risultato <- eventReactive(input$vai, {
     cds <- codici()
-    if (!length(cds)) stop("Nessuna citt\u00e0 per questa selezione.")
-    if (!length(input$curve)) stop("Selezionare almeno una curva.")
+    if (!length(cds)) stop("No city matches this selection.")
+    if (!length(input$curve)) stop("Select at least one curve set.")
     as_of <- input$asof
     from <- input$periodo[1]
     lead_max <- if (as_of >= Sys.Date()) 16 else FC_MAX_LEAD
     to <- min(input$periodo[2], as_of + lead_max)
-    if (from >= to) stop("Periodo non valido.")
+    if (from >= to) stop("Invalid period.")
     set.seed(1)
-    out <- withProgress(message = "Scarico le temperature", value = .3, {
+    out <- withProgress(message = "Downloading temperatures", value = .3, {
       combined_series(cds, from, to, as_of, input$curve, isTRUE(input$debias),
                       baseline = "project", scope = "cities")
     })
-    if (is.null(out)) stop("Nessun dato disponibile per il periodo scelto.")
+    if (is.null(out)) stop("No data available for the period chosen.")
     nomi <- sort(CITIES[URAU_CODE %in% cds, name])
     c(out, list(codes = cds, from = from, to = to, as_of = as_of,
                 chiesto_to = input$periodo[2], lead_max = lead_max,
@@ -739,7 +738,7 @@ server <- function(input, output, session) {
 
   output$g_cum <- renderPlot({
     r <- risultato()
-    shiny::validate(shiny::need(nrow(r$att), "Nessuna previsione nel periodo."))
+    shiny::validate(shiny::need(nrow(r$att), "No prediction in this period."))
     cum <- copy(r$att)[order(curve, date)][, cum := cumsum(att), by = curve]
     cols <- setNames(c("#B2182B", "#1B7837", "#762A83", "#B35806")[
       seq_len(uniqueN(cum$curve))], unique(cum$curve))
@@ -749,15 +748,15 @@ server <- function(input, output, session) {
     obs <- copy(r$daily)[!is.na(observed)][order(date)]
     if (nrow(obs)) {
       obs[, cum_obs := cumsum(observed - expected)]
-      p <- p + geom_line(data = obs, aes(date, cum_obs, colour = "Eccesso osservato"),
+      p <- p + geom_line(data = obs, aes(date, cum_obs, colour = "Observed excess"),
                          linewidth = .9)
-      cols["Eccesso osservato"] <- "#1F2933"
+      cols["Observed excess"] <- "#1F2933"
     }
     p + scale_colour_manual(values = cols) +
-      labs(title = sprintf("Decessi attribuibili al caldo, cumulati \u2014 %s", r$titolo),
-           subtitle = paste("Quanto prevede ciascuna curva e, dove i dati Istat",
-                            "arrivano, l'eccesso effettivamente osservato"),
-           x = NULL, y = "Decessi cumulati", colour = NULL) + tema()
+      labs(title = sprintf("Cumulative heat-attributable deaths \u2014 %s", r$titolo),
+           subtitle = paste("What each curve set predicts and, where the Istat data",
+                            "reach, the excess actually observed"),
+           x = NULL, y = "Cumulative deaths", colour = NULL) + tema()
   })
 
   output$g_temp <- renderPlot({
@@ -765,8 +764,8 @@ server <- function(input, output, session) {
     t <- merge(r$temps, CITIES[, .(code = URAU_CODE, name)], by = "code")
     ggplot(t, aes(date, tmean, colour = name)) + geom_line(linewidth = .7) +
       geom_vline(xintercept = as.numeric(r$as_of), colour = "grey45", linetype = "22") +
-      labs(title = "Temperatura media giornaliera",
-           subtitle = sprintf("ERA5-Land fino al %s, poi previsione Open-Meteo",
+      labs(title = "Daily mean temperature",
+           subtitle = sprintf("ERA5-Land up to %s, Open-Meteo forecast afterwards",
                               format(r$as_of, "%d/%m/%Y")),
            x = NULL, y = "\u00b0C") + tema() +
       theme(legend.position = if (uniqueN(t$name) > 12) "none" else "bottom")
@@ -800,7 +799,7 @@ server <- function(input, output, session) {
     r <- risultato()
     d <- r$daily
     n_obs <- sum(!is.na(d$observed))
-    num <- function(x) format(round(x), big.mark = ".", decimal.mark = ",")
+    num <- function(x) format(round(x), big.mark = ",")
     att <- if (nrow(r$att)) r$att[, .(value = sum(att, na.rm = TRUE)), by = curve] else
       data.table(curve = character(), value = numeric())
     list(n_obs = n_obs, n_days = nrow(d),
@@ -814,28 +813,28 @@ server <- function(input, output, session) {
   output$sintesi <- renderUI({
     tt <- totali(); r <- risultato(); num <- tt$num
     oss <- if (is.na(tt$observed)) sprintf(
-      "nessun dato Istat in questo periodo (i decessi osservati arrivano al %s)",
+      "no Istat data in this period (observed deaths reach %s)",
       format(BUNDLE$data_end, "%d/%m/%Y"))
-      else sprintf("<b>%s</b> decessi osservati%s", num(tt$observed),
+      else sprintf("<b>%s</b> deaths observed%s", num(tt$observed),
                    if (tt$n_obs < tt$n_days)
-                     sprintf(" nei %d giorni coperti su %d", tt$n_obs, tt$n_days) else "")
+                     sprintf(" over the %d days covered out of %d", tt$n_obs, tt$n_days) else "")
     prev <- if (!nrow(tt$att)) "" else paste0(
-      "<p>Decessi attribuibili al caldo previsti dalle curve: ",
+      "<p>Heat-attributable deaths predicted by the curves: ",
       paste(sprintf("<b>%s</b> (%s)", num(tt$att$value), tt$att$curve), collapse = ", "),
       ".</p>")
     taglio <- if (r$to < r$chiesto_to) sprintf(
-      paste("<p class='nota'>Finestra ridotta: dal %s la previsione emessa il %s non",
-            "arriva (al massimo %d giorni di anticipo).</p>"),
-      format(r$to + 1, "%d/%m/%Y"), format(r$as_of, "%d/%m/%Y"), r$lead_max) else ""
+      paste("<p class='nota'>Window shortened: the forecast issued on %s does not",
+            "reach %s (at most %d days ahead).</p>"),
+      format(r$as_of, "%d/%m/%Y"), format(r$to + 1, "%d/%m/%Y"), r$lead_max) else ""
     HTML(sprintf(paste0(
-      "<p><b>%s</b>, dal %s al %s: %s, <b>%s</b> attesi senza caldo.</p>%s%s"),
+      "<p><b>%s</b>, %s to %s: %s, <b>%s</b> expected without heat.</p>%s%s"),
       r$titolo, format(r$from, "%d/%m/%Y"), format(r$to, "%d/%m/%Y"),
       oss, num(tt$expected), prev, taglio))
   })
 
   output$tab <- renderTable({
     tt <- totali(); num <- tt$num
-    nd <- "n.d."
+    nd <- "n/a"
     out <- data.table(
       Quantity = c("Observed deaths", "Expected without heat",
                    "Observed heat deaths (observed - expected)"),
@@ -850,9 +849,9 @@ server <- function(input, output, session) {
   }, align = "lr")
 
   output$copertura <- renderText({
-    sprintf(paste("%d citt\u00e0 nei dati precalcolati (creati il %s), decessi Istat",
-                  "fino al %s. Se l'elenco delle citt\u00e0 non \u00e8 quello atteso,",
-                  "rieseguire targets::tar_make()."),
+    sprintf(paste("%d cities in the precomputed data (built %s), Istat deaths to",
+                  "%s. If the list of cities is not the expected one, re-run",
+                  "targets::tar_make()."),
             nrow(CITIES), format(BUNDLE$built %||% NA, "%d/%m/%Y"),
             format(BUNDLE$data_end, "%d/%m/%Y"))
   })
@@ -864,16 +863,16 @@ server <- function(input, output, session) {
     if (inherits(r, "error")) div(class = "errore", conditionMessage(r)) else NULL
   })
 
-  # ---- scheda Scenari -------------------------------------------------------
+  # ---- Scenarios tab -------------------------------------------------------
   scenari <- eventReactive(input$vai, {
     cds <- codici()
-    if (!length(cds)) stop("Nessuna citt\u00e0 per questa selezione.")
+    if (!length(cds)) stop("No city matches this selection.")
     as_of <- input$asof
     lead_max <- if (as_of >= Sys.Date()) 16 else FC_MAX_LEAD
     horizon <- max(1L, min(as.integer(input$periodo[2] - as_of), lead_max))
     to <- as_of + horizon
     set.seed(1)
-    temps <- withProgress(message = "Scarico le previsioni", value = 0, {
+    temps <- withProgress(message = "Downloading forecasts", value = 0, {
       setNames(lapply(cds, function(cd) {
         incProgress(1 / length(cds), detail = CITIES[URAU_CODE == cd, name])
         # a city whose download fails is dropped, not fatal for the others
@@ -887,9 +886,9 @@ server <- function(input, output, session) {
     persi <- setdiff(cds, names(Filter(function(x) !is.null(x) && nrow(x), temps)))
     temps <- Filter(function(x) !is.null(x) && nrow(x), temps)
     if (!length(temps))
-      stop("Nessuna previsione disponibile per il ", format(as_of, "%d/%m/%Y"),
+      stop("No forecast available for ", format(as_of, "%d/%m/%Y"),
            if (as_of < Sys.Date())
-             ": l'archivio delle emissioni precedenti copre gli ultimi anni e al massimo 7 giorni di anticipo."
+             ": the previous-runs archive covers the last few years and at most 7 days ahead."
            else ".")
     cds <- names(temps)
     ons <- vapply(cds, function(cd) onset_probability(temps[[cd]], cd)$p_onset, 0)
@@ -912,29 +911,29 @@ server <- function(input, output, session) {
     f <- function(i) sprintf("%s (%s \u2013 %s)", round(r$tab$stima[i]),
                              round(r$tab$lo[i]), round(r$tab$hi[i]))
     HTML(sprintf(paste0(
-      "<p><b>%s</b>, previsione emessa il %s, %d giorni in avanti. ",
-      "Probabilit\u00e0 che un'ondata di calore inizi in questa finestra: ",
-      "<b>%s</b> (almeno una citt\u00e0; massimo previsto %.1f \u00b0C).</p>",
-      "<p>Con le previsioni attuali i decessi attribuibili al caldo sono <b>%s</b>. ",
-      "Se il caldo proseguisse, si arriverebbe a <b>%s</b> complessivi.</p>",
-      "<p class='nota'>Curve: %s. Tutto parte da zero alla data di emissione: sono i ",
-      "decessi di cui risponde questa previsione, non quelli gi\u00e0 avvenuti. ",
-      "Intervalli al 95%%: incertezza della curva e del livello atteso. Parte di ",
-      "questi decessi \u00e8 anticipata di pochi giorni piuttosto che aggiunta: la ",
-      "validazione mostra un eccesso molto minore nelle due settimane successive ",
-      "rispetto a quanto previsto dalle curve.%s</p>"),
+      "<p><b>%s</b>, forecast issued on %s, %d days ahead. ",
+      "Probability that a heatwave starts within this window: ",
+      "<b>%s</b> (at least one city; highest temperature forecast %.1f \u00b0C).</p>",
+      "<p>On the current forecast, heat-attributable deaths are <b>%s</b>. ",
+      "If the heat lasted, the total would reach <b>%s</b>.</p>",
+      "<p class='nota'>Curves: %s. Everything starts from zero on the issue date: ",
+      "these are the deaths this forecast answers for, not those already past. ",
+      "95%% intervals: uncertainty of the curve and of the expected level. Part of ",
+      "these deaths is brought forward by a few days rather than added: the ",
+      "validation shows a much smaller excess in the following two weeks than the ",
+      "curves predict.%s</p>"),
       r$titolo, format(r$as_of, "%d/%m/%Y"), r$giorni, pct_fmt(p_any), r$tmax,
       f(1), f(n), r$curva,
       if (length(r$persi)) sprintf(
-        " <b>Escluse per mancato scaricamento delle previsioni: %s.</b>",
+        " <b>Excluded, forecast could not be downloaded: %s.</b>",
         paste(r$persi, collapse = ", ")) else ""))
   })
 
   output$sc_tab <- renderTable({
     r <- scenari()
     data.table(Scenario = r$tab$scenario,
-               Giorni = as.integer(r$tab$giorni),
-               `Decessi attribuibili` = sprintf("%s (%s \u2013 %s)", round(r$tab$stima),
+               Days = as.integer(r$tab$giorni),
+               `Attributable deaths` = sprintf("%s (%s \u2013 %s)", round(r$tab$stima),
                                                 round(r$tab$lo), round(r$tab$hi)))
   }, align = "llr")
 
@@ -945,21 +944,21 @@ server <- function(input, output, session) {
     if (is.null(r) || is.null(r$paths)) return(NULL)
     if (r$paths$total_max < 0.5)
       div(class = "nota", style = "padding:1.2rem; background:#F5F7F9; border-radius:6px;",
-          sprintf(paste("Le previsioni dal %s non superano la soglia di calore in",
-                        "nessuna delle citt\u00e0 selezionate: le curve non attribuiscono",
-                        "alcun decesso al caldo in questa finestra, n\u00e9 negli scenari",
-                        "di proseguimento. Il grafico cumulato resterebbe a zero."),
+          sprintf(paste("The forecasts from %s stay below the heat threshold in every",
+                        "selected city: the curves attribute no death to heat in this",
+                        "window, nor in the scenarios where it lasts. The cumulative",
+                        "chart would sit at zero."),
                   format(r$as_of, "%d/%m/%Y")))
     else plotOutput("sc_plot", height = "420px")
   })
 
   output$sc_plot <- renderPlot({
     r <- scenari()
-    shiny::validate(shiny::need(!is.null(r$paths), "Scenari non disponibili."))
+    shiny::validate(shiny::need(!is.null(r$paths), "Scenarios not available."))
     d <- copy(r$paths$paths)
-    extra <- setdiff(unique(d$scenario), "Previsione")
+    extra <- setdiff(unique(d$scenario), "Forecast")
     extra <- extra[order(as.numeric(gsub("\\D", "", extra)))]   # +5 before +10
-    ord <- c("Previsione", extra)
+    ord <- c("Forecast", extra)
     d[, scenario := factor(scenario, ord)]
     cols <- setNames(c("#B2182B", "#E08214", "#8073AC", "#4393C3")[seq_along(ord)], ord)
     ggplot(d, aes(date, cum, colour = scenario, fill = scenario)) +
@@ -967,17 +966,17 @@ server <- function(input, output, session) {
       geom_ribbon(aes(ymin = lo, ymax = hi), alpha = .18, colour = NA) +
       geom_line(linewidth = 1) +
       scale_x_date(date_labels = "%d %b") +
-      labs(title = sprintf("Decessi attribuibili al caldo da qui in avanti \u2014 %s",
+      labs(title = sprintf("Heat-attributable deaths from here on \u2014 %s",
                            r$titolo),
-           subtitle = sprintf(paste("Cumulati a partire dal %s (giorno zero);",
-                                    "poi scenari in cui il caldo prosegue. Bande al 95%%"),
+           subtitle = sprintf(paste("Cumulated from %s (day zero), then scenarios in",
+                                    "which the heat lasts. 95%% bands"),
                               format(r$as_of, "%d/%m/%Y")),
-           x = NULL, y = "Decessi cumulati dalla data di emissione",
+           x = NULL, y = "Cumulative deaths since the issue date",
            colour = NULL, fill = NULL) +
       scale_colour_manual(values = cols) + scale_fill_manual(values = cols) + tema()
   })
 
-  # ---- scheda EuroMOMO ------------------------------------------------------
+  # ---- EuroMOMO tab ------------------------------------------------------
   momo <- reactive({
     reg <- BUNDLE$region
     if (is.null(reg) || is.null(BUNDLE$flumomo)) return(NULL)
@@ -1025,7 +1024,7 @@ server <- function(input, output, session) {
                         "deaths: run targets::tar_make() and copy the new file next",
                         "to app.R.")))
     from <- input$mm_periodo[1]; to <- input$mm_periodo[2]
-    shiny::validate(shiny::need(!is.na(from) && !is.na(to) && from < to, "Periodo non valido."))
+    shiny::validate(shiny::need(!is.na(from) && !is.na(to) && from < to, "Invalid period."))
     cds <- reg$cities
     combined_series(cds, from, to, min(to, Sys.Date()), input$curve %||% PUB, FALSE,
                     baseline = "flumomo",
@@ -1034,7 +1033,7 @@ server <- function(input, output, session) {
 
   output$g_momo <- renderPlot({
     r <- momo_series()
-    shiny::validate(shiny::need(!is.null(r) && nrow(r$daily), "Nessun dato per il periodo."))
+    shiny::validate(shiny::need(!is.null(r) && nrow(r$daily), "No data for this period."))
     reg <- BUNDLE$region
     scope_txt <- if (input$mm_ambito == "reg") "all municipalities"
                  else paste(sort(CITIES[URAU_CODE %in% reg$cities, name]), collapse = ", ")
