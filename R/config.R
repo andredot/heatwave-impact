@@ -19,7 +19,7 @@ cfg <- list(
   cache_dir  = "data/cache",
   # 491 MB file with 1000 coefficient draws that keep the correlation between
   # age groups. FALSE = draw from vcov.csv (age groups independent).
-  use_coef_simu = FALSE,
+  use_coef_simu = TRUE,
 
   # ---- city definition (Urban Audit city -> Istat comuni) -------------------
   urau_year     = 2021,   # release used to label the crosswalk

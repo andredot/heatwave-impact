@@ -25,6 +25,7 @@ cfg      <- tar_read(config)
 periods  <- tar_read(periods)
 data_end <- tar_read(data_end)
 xw       <- tar_read(crosswalk)
+ck       <- xw$checks          # one row per city: composition, ratios, status
 fmt <- function(x, d = 2) formatC(x, format = "f", digits = d, big.mark = ",")
 pct <- function(x, d = 0) paste0(fmt(100 * x, d), "%")
 kbl <- function(x, ...) knitr::kable(x, ...)
@@ -36,48 +37,37 @@ The published exposure-response functions (ERFs) of Masselot et al. (2023,
 *Lancet Planetary Health*) are the standard source of temperature-mortality
 risk for European cities, and the natural basis for a heat-mortality
 forecasting system. This report asks whether they still describe mortality in
-Italian cities after the period they were estimated on, how much of any
-mismatch can be repaired by re-estimating them on recent Italian data, and
-how far ahead a temperature forecast can drive them.
+Italian cities after the period they were estimated on.
 
-Masselot's curves come from a three-stage model. In 232 cities with observed
-daily mortality (for Italy, the MCC data covering 2001-2010), a quasi-Poisson
-distributed-lag non-linear model was fitted; the city curves were then pooled
-in a meta-regression on city characteristics, which was used to predict
-curves for all 854 cities. The paper does not include an out-of-sample test
-over later years. We therefore validate the curves in the way they were
-built, plus a check aimed at the forecasting use:
+In 232 cities with observed daily mortality (for Italy, the MCC data covering 
+2001-2010), a quasi-Poisson distributed-lag non-linear model was fitted; 
+the city curves were then pooled in a meta-regression on city characteristics,
+which was used to predict curves for all 854 cities. The paper does not include
+an out-of-sample test over later years.
 
 1. **Temperature forecast skill** — archived Open-Meteo forecasts
    (`r cfg$forecast_model`, leads `r min(cfg$forecast_leads)`-`r max(cfg$forecast_leads)`
    days) against ERA5-Land, to decide the usable horizon.
-2. **Curve comparison (test A)** — Masselot's first-stage model refitted,
+2. **Curve comparison** — Masselot's first-stage model refitted,
    with identical specification, on Istat deaths and ERA5-Land for
    `r periods$test$label`, and compared with the published curves
    `r if (!is.null(periods$repro)) paste0("(and for ", periods$repro$label, ", a period also independent of the Italian MCC data)") else ""`.
-3. **Observed vs predicted heat deaths (test B)** — for heatwave episodes
+3. **Observed vs predicted heat deaths** — for heatwave episodes
    and whole summers, the heat deaths predicted by the curves are compared
    with the deaths observed above a counterfactual baseline of deaths
    expected without heat, for the published curves and for curves
    re-estimated on Italian data of an earlier period.
 
-Mortality data end on **`r format(data_end, "%d %B %Y")`**.
+Italian published mortality data end on **`r format(data_end, "%d %B %Y")`**.
 
 # Data and alignment
 
 ## Do we reproduce the paper's own numbers?
 
-Everything below rests on our reconstruction of the published curves, so it
-is checked first: our code is run on Masselot's own exposure series
-(1990-2019) and his own annual deaths, and compared with the numbers
-published in `results.zip`. Minimum mortality temperatures come out
-identical and annual heat-attributable deaths are reproduced exactly, so the
-curves, the MMT search and the attribution formula are applied as in the
-paper and any mismatch below belongs to the curves rather than to us. The
-relative risk at the 99th percentile differs because the paper reports its
-curve on a spline ending at the 0.1st and 99.9th percentiles while
-attribution uses one ending at the daily minimum and maximum; comparisons
-here always use the same basis on both sides.
+Code is run on paper's own exposure series (1990-2019) and his own annual deaths, 
+and compared with the numbers published in `results.zip`. Minimum mortality 
+temperatures come out identical and annual heat-attributable deaths are 
+reproduced exactly.
 
 ```{r recon}
 rc <- tar_read(recon_check)
@@ -104,40 +94,19 @@ year to the largest. The pipeline therefore is the paper's pipeline.
 
 ## City definition
 
-Masselot's cities are Urban Audit cities, coded with Eurostat's 2020/2021
+Original paper's cities are Urban Audit cities, coded with Eurostat's 2020/2021
 numbering, in which the *greater city* is the default unit wherever the
 urban centre extends well beyond the central municipality (e.g. Milan,
 Naples): from the 2021 release greater cities are merged into the city
-level, so a single "city" polygon can cover dozens of comuni. Which comuni
-make up each city therefore has to be established before any death can be
-counted, and it is not a detail: Milan as a greater city is three times
-Milan as a comune, and the curve would be applied to the wrong population.
+level, so a single "city" polygon can cover dozens of comuni.
 
-The composition is taken from the source that defines it. Istat publishes,
-in its SITUAS portal, the report *Composizione delle Città (Cities) 2021*,
-which lists every City and Greater City of EU Regulation 2019/1130 with its
-Urban Audit code and the comuni that compose it, with their Istat codes:
+The composition is taken from the source: Istat SITUAS portal, which lists every
+Urban Audit city and the comuni that compose it, with their Istat codes:
 `r format(nrow(tar_read(istat_cities)), big.mark = ",")` comuni in
 `r data.table::uniqueN(tar_read(istat_cities)$city_code)` cities, of which
 `r data.table::uniqueN(tar_read(istat_cities)[level == "greater city", city_code])`
-greater cities. Those are exactly the two keys this analysis needs — the
-Urban Audit code of Masselot's curves and the comune code of the Istat
-mortality file — so which comuni make up a city is no longer inferred.
-Codes are matched on the six-character stem, since releases differ in the
-trailing version digit (`IT001C` vs `IT001C1`). The file is shipped with the
-repository (`r basename(tar_read(istat_cities_file))`), so a fresh run
-reproduces the geography without a download.
-
-One thing the report cannot settle is which published *level* Masselot's
-figures describe. Under the regulation the same code denotes a City and,
-where one exists, a Greater City, and his metadata mixes the two: for Milan
-and Naples his population is the greater city, while for the eight other
-greater cities it is the core comune alone. Summing the greater city there
-roughly doubles both the population and the deaths — which is exactly what
-the alignment check caught, since the two ratios moved together. Both levels
-are therefore built from the same official file (the full composition, and
-the comune bearing the city's name) and the one whose population matches the
-metadata is kept. The table below shows the choice is not a close call.
+greater cities. The table below shows the difference between original paper and 
+this implementation sits below a reasonable difference.
 
 ```{r crosswalk-levels}
 cnd <- attr(tar_read(istat_map), "candidates")
@@ -167,18 +136,6 @@ deaths implied by Masselot's population structure and death rates: cities
 failing this check are excluded, since their mortality would not be the
 population the curve describes.
 
-```{r crosswalk-source}
-cov <- tar_read(istat_coverage)
-cat("Composition used:", xw$source, "\n")
-if (!is.null(cov)) {
-  kbl(cov$cities[, .N, by = .(`In the Istat report` = matched)],
-      col.names = c("In the Istat report", "Cities of the metadata"))
-  miss <- cov$cities[matched == FALSE, .(City = name, Code = URAU_CODE,
-                                         Population = fmt(pop, 0))]
-  if (nrow(miss)) kbl(miss, caption = "Cities of Masselot's metadata absent from the Istat report")
-}
-```
-
 ```{r crosswalk-agreement}
 ag <- xw$checks[!is.na(agreement), .(City = name, Level = level,
                                      Comuni = n_comuni, `Comuni (geometric)` = n_comuni_geo,
@@ -190,21 +147,6 @@ kbl(xw$checks[!is.na(agreement), .(Cities = .N,
 dis <- ag[as.numeric(Agreement) < 1]
 if (nrow(dis)) kbl(dis[order(as.numeric(Agreement))],
                    caption = "Cities where the two compositions differ")
-```
-
-```{r crosswalk-summary}
-ck <- xw$checks
-kbl(ck[, .N, by = .(status, analysed)][order(-N)],
-    col.names = c("Status", "Analysed", "Cities"))
-kbl(ck[, .N, by = .(level)][order(-N)], col.names = c("Definition retained", "Cities"))
-```
-
-```{r crosswalk-greater}
-gc <- ck[!is.na(n_comuni) & n_comuni > 1,
-         .(City = name, Level = level, Comuni = n_comuni,
-           `Pop. ratio` = fmt(pop_ratio), `Deaths ratio` = fmt(deaths_ratio), Status = status)]
-if (nrow(gc)) kbl(gc[order(-Comuni)],
-                  caption = "Cities made of more than one comune (greater cities)")
 ```
 
 ```{r crosswalk-plot, fig.height=4.5}
@@ -236,7 +178,7 @@ nok  <- ck[status == "ok", .N]
 ndth <- ck[status == "deaths differ from metadata rates", .N]
 npop <- ck[status == "check population", .N]
 nout <- ck[analysed == FALSE]
-cat(sprintf(paste0("Of the %d cities in Masselot's Italian metadata, %d are carried into ",
+cat(sprintf(paste0("Of the %d cities in metadata, %d are carried into ",
                    "the analysis: %d pass every check, %d keep a deaths ratio outside the ",
                    "accepted band while their population matches (the regional death rates ",
                    "in his metadata, not a wrong city, so they stay with the flag) and %d ",
@@ -246,12 +188,6 @@ if (nrow(nout))
   cat(sprintf("Excluded: %s.\n\n",
               paste(sprintf("%s (%s)", nout$name, nout$status), collapse = "; ")))
 ```
-
-The population ratios cluster between 0.9 and 1.1: the comuni we sum are the
-population Masselot's curves describe. Massa is the one city of his metadata
-with no composition to match: `IT045C` is a City in the earlier Urban Audit
-releases and not one in 2021, so neither the Istat report nor the 2021
-polygons contain it. Its curve is published but cannot be tested here.
 
 ## Age groups
 
@@ -296,7 +232,7 @@ br <- merge(br, tar_read(cities)[, .(URAU_CODE, name)], by = "URAU_CODE")[order(
 Averaging the cells inside each polygon brings the median difference to
 `r fmt(ex[, median(bias)])` °C and the median daily error to
 `r fmt(ex[, median(mae)])` °C, with a correlation of 1.000: our series and
-Masselot's are effectively the same variable. What remains is topographic.
+the original one are effectively the same variable. What remains is topographic.
 The largest positive differences are Trento, Cosenza and Bolzano, whose
 polygons run up the surrounding slopes, so the city average is colder than
 the built-up area; the largest negative ones, Lecco and Caserta, sit beside a
@@ -314,6 +250,10 @@ below stop at the 1990-2019 maximum.
 
 ```{r fc-setup}
 fs <- tar_read(fc_skill)
+# the three slices the text below quotes
+sc <- fs$scores[subset == "Warm season"][order(lead)]
+hd <- fs$scores[subset == "Hot days (> P90)"][order(lead)]
+dt <- fs$detection[order(lead)]
 ```
 
 Forecasts from the Open-Meteo Previous Runs API (value predicted N days
@@ -322,10 +262,11 @@ are scored against ERA5-Land at the same point. The reference is persistence
 (tomorrow = today): skill above 0 means the forecast beats it.
 
 ```{r fc-plot, fig.height=6}
-sc <- melt(fs$scores, id.vars = c("subset", "lead"), measure.vars = c("mae", "rmse", "bias", "mae_persistence"))
-sc[, variable := factor(variable, c("mae", "rmse", "bias", "mae_persistence"),
-                        c("MAE", "RMSE", "Bias", "MAE of persistence"))]
-ggplot(sc, aes(lead, value, colour = variable)) + geom_hline(yintercept = 0, colour = "grey70") +
+# a different name: `sc` above is the warm-season slice the prose quotes
+scl <- melt(fs$scores, id.vars = c("subset", "lead"), measure.vars = c("mae", "rmse", "bias", "mae_persistence"))
+scl[, variable := factor(variable, c("mae", "rmse", "bias", "mae_persistence"),
+                         c("MAE", "RMSE", "Bias", "MAE of persistence"))]
+ggplot(scl, aes(lead, value, colour = variable)) + geom_hline(yintercept = 0, colour = "grey70") +
   geom_line(linewidth = .8) + geom_point() + facet_wrap(~ subset) +
   scale_x_continuous(breaks = cfg$forecast_leads) +
   labs(x = "Lead time (days)", y = "°C", colour = NULL,
@@ -334,29 +275,9 @@ ggplot(sc, aes(lead, value, colour = variable)) + geom_hline(yintercept = 0, col
 ```
 
 ```{r fc-table}
-kbl(dcast(fs$scores, lead ~ subset, value.var = "mae")[, lapply(.SD, fmt), by = lead],
-    caption = "MAE (°C) by lead time")
 kbl(fs$detection[, .(Lead = lead, Hits = hits, Misses = misses, `False alarms` = false_alarms,
                      POD = fmt(pod), FAR = fmt(far))],
     caption = sprintf("Detection of heatwave days (T >= P%s), warm season", cfg$hw_pct))
-```
-
-```{r fc-impact}
-fi <- tar_read(fc_impact)
-if (!is.null(fi)) {
-  kbl(fi$summary[, .(Lead = lead, Episodes = episodes, `Total ratio forecast/ERA5` = fmt(ratio_total),
-                     `MAE (deaths per episode)` = fmt(mae_deaths, 1),
-                     `Median abs. relative error` = pct(median_abs_rel_err),
-                     `Mean temp. error (°C)` = fmt(mean_temp_error))],
-      caption = "Predicted excess deaths of each episode with forecast vs ERA5-Land temperatures")
-}
-```
-
-```{r fc-numbers}
-sc <- fs$scores[subset == "Warm season"][order(lead)]
-hd <- fs$scores[subset == "Hot days (> P90)"][order(lead)]
-dt <- fs$detection[order(lead)]
-fi2 <- if (!is.null(fi)) fi$summary[order(lead)] else NULL
 ```
 
 Forecast error grows slowly: the mean absolute error in the warm season is
@@ -367,27 +288,13 @@ Heatwave days are detected reliably at every lead (probability of detection
 `r fmt(min(dt$pod))`-`r fmt(max(dt$pod))`), at the cost of more false alarms as
 the lead grows (`r fmt(min(dt$far))` to `r fmt(max(dt$far))`).
 
-That warm bias matters more than its size suggests. Because the curve is
-convex above the MMT, predicted heat deaths run
-`r if (!is.null(fi2)) pct(fi2$ratio_total[1] - 1) else "well"` above the
-ERA5-Land-based figure already at one day, rising to
-`r if (!is.null(fi2)) pct(fi2$ratio_total[nrow(fi2)] - 1) else "more"` at seven. Most of
-this is bias rather than noise, so it can be removed: `fc_debias` in the
+Most of this is bias rather than noise, so it can be removed: `fc_debias` in the
 configuration subtracts the city, month and lead mean error, which should be
 switched on before the forecasts are used to produce numbers rather than
 warnings. With it on, the usable horizon is set by the growth in error, not
 by the bias.
 
-**Reading the horizon.** Because the curve is convex above the MMT, random
-forecast errors do not cancel out: they inflate predicted deaths on average,
-so the total ratio drifts above 1 as the lead grows even without any
-temperature bias. The error that matters is the one in predicted
-deaths, since the curve is steep above the minimum-mortality temperature: the
-last table translates temperature errors into episode deaths. A lead is
-usable while its relative error stays well below the uncertainty of the curve
-itself (the width of the predicted-excess interval in test B).
-
-# Test A: refitting Masselot's first-stage model
+# Refitting the original first-stage model
 
 In each city the model of Masselot's first stage is refitted exactly (script
 `05_FirstStage.R` of the authors' repository): quasi-Poisson regression;
@@ -404,8 +311,8 @@ searched between the `r cfg$mmp_range[1]`th and `r cfg$mmp_range[2]`th
 percentiles, as in the paper.
 
 The main comparison is the relative risk at the `r cfg$rr_pct`th percentile
-versus the published MMT (a common reference for both curves). Differences
-are pooled across cities with a random-effects meta-analysis.
+versus the published MMT. Differences are pooled across cities with a 
+random-effects meta-analysis.
 
 ```{r curve-fun}
 show_curve_test <- function(ct, pooled, label) {
@@ -449,12 +356,9 @@ show_curve_test(ct, pt, periods$test$label)
 forest_plot(ct, pt, periods$test$label)
 ```
 
-Three and a half years are short for a model with 20 cross-basis parameters,
-so city curves are drawn only over the temperatures observed in the period
-and are stabilised as in Masselot's second stage: the refitted coefficients
-are pooled in a multivariate meta-analysis and each city is represented by
-its best linear unbiased prediction (BLUP), which borrows strength from the
-other cities in proportion to its own imprecision.
+The refitted coefficients are pooled in a multivariate meta-analysis and each 
+city is represented by its best linear unbiased prediction (BLUP), which borrows
+strength from the other cities in proportion to its own imprecision.
 
 ```{r test-a-curves, fig.height=9}
 bt <- tar_read(blup_test)
@@ -481,17 +385,12 @@ their own mortality show much the same gap as cities where the curve was
 extrapolated from the meta-regression
 (`r fmt(pt[grepl("MCC", group) & !grepl("Difference", group), ratio], 2)` against
 `r fmt(pt[grepl("extrapolated", group) & !grepl("Difference", group), ratio], 2)`,
-difference not significant). The spatial prediction is therefore not the
-problem.
+difference not significant).
 
 The disagreement is confined to the heat arm. Above the minimum the refitted
 curve rises much less steeply than the published one in every large city, and
-the gap widens with temperature. Below the minimum the two run close together
-in most cities, while in several (Catania, Florence, Bari, Milan, Verona) the
-refitted cold arm sits somewhat above the published one, so this is not a
-curve that is flatter everywhere: it is a curve with a weaker heat effect.
-The cold side is not what these tests are about, and it is confounded by
-influenza, so no weight is put on it here.
+the gap widens with temperature. However, the cold side it's confounded by
+influenza, and it's not within the scope of this analysis.
 
 ```{r test-a-blup}
 if (!is.null(bt)) kbl(bt$results[, .(Cities = .N, `Median RR99 published` = fmt(median(rr99_pub), 3),
@@ -510,17 +409,10 @@ print(ggplot(r[level == "all20"], aes(af_pub, af_new)) + geom_abline(colour = "g
        title = sprintf("Heat-attributable fraction of deaths 20+, %s", periods$test$label)))
 ```
 
-```{r test-a-age}
-ra <- r[level == "age" & n_ages == 1 & !is.na(wald_p)]
-if (nrow(ra)) kbl(ra[, .(Cities = .N, `Median RR99 ratio` = fmt(exp(median(d_lr99)), 3),
-                         `Wald p < 0.05` = pct(mean(wald_p < .05))), by = series][order(series)],
-                  caption = "Single age groups: equality of the five coefficients (Wald test)")
-```
-
 ```{r test-a-repro, results='asis'}
 if (isTRUE(cfg$run_reproduction)) {
 cat("\n\n## ", periods$repro$label, "\n\n")
-cat("This period uses Masselot's own ERA5-Land series, so the only difference ",
+cat("This period uses Masselot's original ERA5-Land series, so the only difference ",
     "with the published model is the mortality data. For Italian MCC cities the ",
     "published curves used 2001-2010 data, so these years are independent too; ",
     "for extrapolated cities this is a direct test of the spatial prediction ",
@@ -565,21 +457,20 @@ if (nrow(cp$pooled)) {
 ```
 
 The ratio falls in every step, and the trend is significant. Two of the three
-windows use Masselot's own temperatures, so the decline cannot be an artefact
-of our exposure series.
+windows use original paper's own temperatures, so the decline shouldn't be an
+artefact of a different exposure series.
 
 # One region in full: `r cfg$region_focus`
 
-Everything above tests the cities that carry enough deaths for Masselot's
+Everything above tests the cities that carry enough deaths for original paper's
 first stage: 5,000 over the period. An operational system needs a curve for
-*every* city of the region it covers, small ones included, and the second
-stage is what makes that possible. A city whose own fit is noisy enters the
-multivariate random-effects meta-analysis with a large variance, so its best
-linear unbiased prediction sits close to the pooled Italian curve: it
-contributes what its own data support and borrows the rest. The pooling here
-uses every Italian city fitted in the test period, not only the region's, and
-the first stage is the same model with the same knots — only the death
-threshold is lifted.
+*every* city of the region it covers, small ones included. A city whose own fit 
+is noisy enters the multivariate random-effects meta-analysis with a large 
+variance, so its best linear unbiased prediction sits close to the pooled 
+Italian curve: it contributes what its own data support and borrows the rest. 
+The pooling here uses every Italian city fitted in the test period, not only the
+region's, and the first stage is the same model with the same knots — only the
+death threshold is lifted.
 
 ```{r region-table}
 rt <- tar_read(region_table)
@@ -598,11 +489,6 @@ if (is.null(rt) || !nrow(rt)) cat("No city of this region is in the analysis.\n"
                                   "MMT, %s, %s"), cfg$region_focus, periods$test$label))
 }
 ```
-
-The interval on the own fit against the interval on the BLUP is the shrinkage
-made visible: where a city has few deaths the first widens and the second
-stays narrow and close to the regional average, which is the behaviour that
-lets the curve be used at all.
 
 ```{r region-curves, fig.height=7}
 bl <- tar_read(blup_region)
@@ -626,35 +512,27 @@ if (!is.null(bl) && nrow(bl$bands)) {
 }
 ```
 
-```{r region-notfitted}
-if (!is.null(rt) && nrow(rt[status != "fitted"]))
-  kbl(rt[status != "fitted", .(City = name, Status = status)],
-      caption = "Cities of the region without a refitted curve")
-```
-
-# Test B: observed vs predicted heat deaths
+# Observed vs predicted heat deaths
 
 **Deaths expected without heat.** For every city and age group a baseline
-B is estimated: a quasi-Poisson model with day of week, a slow trend and
+is estimated: a quasi-Poisson model with day of week, a slow trend and
 `r cfg$baseline_harmonics` annual harmonics, fitted only on *reference days*
 — outside the influenza season (months
 `r paste(month.abb[cfg$baseline_exclude_months], collapse = ", ")`) and not
 within `r cfg$baseline_hot_lag` days after a day above the curve's MMT. Like
 EuroMOMO baselines, it captures the normal seasonal pattern, including the
-lower mortality of summer, without the heat itself; cool summer days anchor
-the summer level. Reference days are cool, so part of their deaths is
-cold-related: `r if (isTRUE(cfg$baseline_cold_offset)) "the published cold effect enters the model as an offset, so B is the number of deaths expected at the minimum-mortality temperature, the reference of the attributable-deaths formula" else "no correction is applied, so B also contains cold-related deaths"`. Age groups with fewer than `r cfg$baseline_min_daily`
+lower mortality of summer, without the heat itself. Reference days are cool, so 
+part of their deaths is cold-related: `r if (isTRUE(cfg$baseline_cold_offset)) "the published cold effect enters the model as an offset, so B is the number of deaths expected at the minimum-mortality temperature, the reference of the attributable-deaths formula" else "no correction is applied, so B also contains cold-related deaths"`. Age groups with fewer than `r cfg$baseline_min_daily`
 deaths per day use the 20+ baseline times their share.
 
 Over each window:
 
-- **Observed heat deaths** X = observed deaths − B;
-- **Predicted heat deaths** P = Σ B × (RR − 1) over the days at or above the
+- **Observed heat deaths** X = observed deaths − Baseline;
+- **Predicted heat deaths** P = Σ Baseline × (RR − 1) over the days at or above the
   MMT, with the relative risk centred on the MMT. Days below the MMT inside a
   window belong to the cold side of the curve and are counted separately.
 
-If the curves are right, X scatters around P with slope 1. Windows are
-heatwave episodes (spells of at least `r cfg$hw_min_days` days above the
+Windows are heatwave episodes (spells of at least `r cfg$hw_min_days` days above the
 city's P`r cfg$hw_pct`, plus `r cfg$tail_days` days), and whole summers
 (June-September), which do not depend on any episode definition.
 Uncertainty of both the baseline and the curves is propagated.
@@ -726,80 +604,16 @@ if (has_ep) {
 }
 ```
 
-```{r test-b-synthesis, results='asis'}
-if (has_ep) {
-  pt <- tar_read(pooled_test); bt <- tar_read(blup_test)
-  rr_ratio <- pt[group == "All cities", ratio]
-  ex <- if (!is.null(bt)) (median(bt$results$rr99_blup) - 1) / (median(bt$results$rr99_pub) - 1) else NA
-  sl <- ev$calibration[windows == "Heatwave episodes", slope]
-  cat(sprintf(paste("\n\n**The two tests agree.** Test A finds refitted heat risks at the 99th",
-    "percentile %s times the published ones; on the scale that matters for attributable",
-    "deaths (RR - 1) that is a factor of %s. Test B finds a calibration slope of %s.",
-    "Two methods that share only the published curves - one fitting a new exposure-response",
-    "function, the other counting deaths against a baseline - agree on the answer.\n\n"),
-    fmt(rr_ratio, 3), fmt(ex, 2), fmt(sl, 2)))
-}
-```
-
-The relationship is strong (r = `r fmt(ev$calibration[windows == "Heatwave episodes", r])`
-across episodes): the curves rank
-episodes correctly, and overstate each of them by roughly the same factor
-(`r fmt(ev$calibration[windows == "Heatwave episodes", predicted / observed])`
-overall). The effect is visible in the city panel above, where the predicted
-daily peak sits well above the observed one while its timing is right. By year,
-the largest observed excess is in
-`r ev$by_year[type == "episode"][which.max(X), year]` and the smallest ratio of
-observed to predicted in
-`r ev$by_year[type == "episode"][which.min(X / P), year]`.
-
-```{r test-b-ratio, fig.height=4.6}
-if (has_ep) {
-  cs_r <- tryCatch(tar_read(curve_sets)$windows, error = function(e) NULL)
-  rr <- rbind(
-    ev$windows[type %in% c("episode", "summer"),
-               .(type, P, X, v, curves = "Published (Masselot et al.)")],
-    if (!is.null(cs_r)) cs_r[, .(type, P, X, v, curves)] else NULL)
-  # the ratio is unstable when almost nothing is predicted
-  thr <- stats::quantile(rr$P[rr$P > 0], .5, na.rm = TRUE)
-  rr <- rr[P >= thr]
-  rr[, `:=`(ratio = X / P,
-            type = factor(type, c("episode", "summer"),
-                          c("Heatwave episodes", "Whole summers")))]
-  print(ggplot(rr, aes(P, ratio, colour = curves)) +
-    geom_hline(yintercept = 1, colour = "grey40", linetype = 2) +
-    geom_point(aes(size = 1 / pmax(v, 1)), alpha = .6) +
-    geom_smooth(method = "lm", formula = y ~ x, se = FALSE, linewidth = .8) +
-    facet_wrap(~ type, scales = "free_x") + scale_size(guide = "none") +
-    coord_cartesian(ylim = stats::quantile(rr$ratio, c(.02, .98), na.rm = TRUE)) +
-    labs(x = "Predicted heat deaths", y = "Observed / predicted", colour = NULL,
-         title = "Does the over-prediction grow with the size of the episode?",
-         subtitle = paste(strwrap(sprintf(paste(
-           "Windows with at least %s predicted deaths; 1 = calibrated.",
-           "A downward line means the largest episodes are the most over-predicted."),
-           fmt(thr, 0)), width = 95), collapse = "\n")) +
-    theme(legend.position = "bottom"))
-}
-```
-
 ```{r test-b-list}
 if (has_ep) {
   el <- merge(ev$windows[type == "episode"], tar_read(cities)[, .(URAU_CODE, name)],
               by = "URAU_CODE")[order(-O)]
-  kbl(el[1:min(25, .N), .(City = name, Start = start, End = end, O = fmt(O, 0),
+  kbl(el[1:min(15, .N), .(City = name, Start = start, End = end, O = fmt(O, 0),
                           `Expected without heat` = fmt(B, 0), `Observed heat deaths` = fmt(X, 0),
                           Predicted = sprintf("%s (%s to %s)", fmt(P, 0), fmt(P_lo, 0), fmt(P_hi, 0)),
                           `In 95% PI` = in_pi)],
       caption = "Largest episodes")
 }
-```
-
-```{r test-b-failures}
-if (nrow(cf$failures)) kbl(merge(cf$failures, tar_read(cities)[, .(URAU_CODE, name)], by = "URAU_CODE")[
-  , .(City = name, Age = agegroup, Reason = reason)], caption = "Baseline models that needed a fallback or failed")
-```
-
-```{r no-episodes, results='asis'}
-if (!has_ep) cat("No window could be evaluated.")
 ```
 
 # Curves re-estimated on Italian data
@@ -858,55 +672,7 @@ if (!is.null(ex)) {
 }
 ```
 
-## Sensitivity: the FluMOMO baseline
-
-Test B measures observed heat deaths against our own baseline of deaths
-expected without heat. To check that the result does not depend on it, the
-same comparison is repeated against the baseline of the official EuroMOMO
-FluMOMO code, run on the comuni of the validated cities of
-`r tar_read(config)$flumomo$region` by a different method, at weekly
-resolution and for all ages. The expected series there is `EB + EdIA`, the
-FluMOMO baseline plus the deaths it attributes to influenza, so influenza
-stays out of the residual and what remains above it in the warm season is the
-heat signal. Only the warm-season weeks for which the curves produce a
-prediction are used, that is those of the test period: FluMOMO is fitted on a
-longer history, and earlier weeks would enter with a prediction of zero.
-
-```{r flumomo-sens}
-fs2 <- tryCatch(tar_read(flumomo_sensitivity), error = function(e) NULL)
-if (is.null(fs2)) {
-  cat("Not available: the FluMOMO targets have not been run",
-      "(the official code must be unzipped in the folder set in config.R).")
-} else {
-  kbl(fs2$calibration[, .(Curves = curves, `Summer weeks` = weeks,
-                          `Observed heat deaths` = fmt(observed, 0),
-                          `Predicted` = fmt(predicted, 0),
-                          `Observed / predicted` = fmt(ratio),
-                          Slope = sprintf("%s (%s-%s)", fmt(slope), fmt(lo), fmt(hi)),
-                          `FluMOMO extreme temperature` = fmt(flumomo_ET, 0))],
-      caption = sprintf(paste("Test B against the FluMOMO baseline, %d cities, %s to %s.",
-                              "The last column is what FluMOMO itself attributes to",
-                              "extreme temperature over the same weeks."),
-                        fs2$n_cities, fs2$period[1], fs2$period[2]))
-}
-```
-
-```{r flumomo-sens-plot, fig.height=4.5}
-if (!is.null(fs2)) {
-  w <- fs2$weekly[month %in% cfg$warm_months]
-  print(ggplot(w, aes(P, X, colour = curves)) +
-    geom_hline(yintercept = 0, colour = "grey80") +
-    geom_abline(colour = "grey40", linetype = 2) +
-    geom_point(alpha = .7) + geom_smooth(method = "lm", formula = y ~ 0 + x, se = FALSE) +
-    labs(x = "Predicted heat deaths in the week", y = "Observed above the FluMOMO baseline",
-         colour = NULL, title = "Weekly heat deaths against the FluMOMO baseline") +
-    theme(legend.position = "bottom"))
-}
-```
-
-`r if (!is.null(fs2)) "Two baselines built on different principles, at different resolutions, should not give identical numbers; what matters is whether they agree on the direction and the rough size of the gap." else ""`
-
-# Interpretation
+# Interpretation and limitations
 
 ```{r interpretation, results='asis'}
 pt <- tar_read(pooled_test); cp <- tar_read(curves_periods)
@@ -933,97 +699,29 @@ cat(sprintf(paste0(
 "only above the minimum mortality temperature; heterogeneity between cities is ",
 "small; and cities whose curves came from their own mortality behave like ",
 "cities where the curve was extrapolated. What is out of date is the level of ",
-"heat risk.\n\n")))
-
-cat(sprintf(paste0(
-"**It is a time problem.** Window by window the ratio falls: %s, a change of ",
+"heat risk. Window by window the ratio falls: %s, a change of ",
 "%s per decade (95%% CI %s-%s, p = %s), with the two earlier windows using ",
 "Masselot's own temperatures. The Italian mortality behind the published ",
 "curves ends in 2010 and includes the 2003 heatwave, so these curves describe ",
-"a population that was more vulnerable to heat than today's. Warning systems, ",
-"air conditioning and changes in the care of frail elderly people are the usual ",
-"explanations, and the pattern here is consistent with them.\n\n"),
+"a population that was more vulnerable to heat than today's.\n\n"),
 paste(sprintf("%s in %s", fmt(cp$pooled$ratio, 3), cp$pooled$window), collapse = ", "),
 fmt(cp$trend$change_per_decade, 3), fmt(cp$trend$lo, 3), fmt(cp$trend$hi, 3),
 fmt(cp$trend$p, 3)))
-
-cat(sprintf(paste0(
-"**Re-estimating the level repairs most of it, out of sample.** Curves fitted ",
-"on Italian data that end before the test period bring the observed-to-",
-"predicted ratio from %s to %s (\"%s\"), with a slope of %s. The framework is ",
-"sound: the model form, the exposure, the baseline and the attribution all ",
-"work; the published numbers simply carry the risk level of the early 2000s. ",
-"For operational use the recalibrated curves are the ones to adopt, refreshed ",
-"as new years accumulate.\n\n"),
-fmt(ep$observed / ep$predicted), fmt(best$ratio), best$curves, fmt(best$slope)))
-
-cat(sprintf(paste0(
-"**Displacement is part of the story.** In the %d days after an episode the ",
-"published curves predict %s further deaths while %s are observed above the ",
-"baseline, so a large part of what the curves count is death brought forward ",
-"by days rather than added. A cumulative 21-day curve carries this inside it, ",
-"which is one reason a curve fitted on longer series transfers better than a ",
-"short one.\n\n"), cfg$post_days, fmt(ev$totals$post_predicted, 0),
-fmt(ev$totals$post_observed, 0)))
-
-if (!is.null(fs2)) {
-  fpub <- fs2$calibration[curves == "Published (Masselot et al.)"]
-  closer <- abs(log(pmax(fpub$flumomo_ET, 1) / fpub$predicted)) <
-    abs(log(pmax(fpub$observed, 1) / fpub$predicted))
-  cat(sprintf(paste0(
-  "**A second baseline.** Repeating the comparison against the baseline of the ",
-  "official FluMOMO code, on %d %s at weekly resolution, gives a slope of %s ",
-  "for the published curves (observed over predicted %s), against %s in the ",
-  "main test. FluMOMO itself attributes %s deaths to extreme temperature over ",
-  "those weeks, against %s predicted by the published curves, so %s\n\n"),
-  fs2$n_cities, ifelse(fs2$n_cities == 1, "city,", "cities,"),
-  fmt(fpub$slope), fmt(fpub$ratio), fmt(ep$slope), fmt(fpub$flumomo_ET, 0),
-  fmt(fpub$predicted, 0),
-  if (closer) paste("the two model-based estimates sit closer to each other than",
-                    "either does to the observed excess.")
-  else paste("the two model-based estimates differ from each other by as much as",
-             "the published curves differ from the observed excess.")))
-}
-
-cat(sprintf(paste0(
-"**What is not settled.** Part of the recent decline may not be adaptation: ",
-"the 2020-2022 excess mortality removed frail people from the population, ",
-"which lowers heat susceptibility in 2023-2025 and should partly revert. The ",
-"published curves are also meta-regression predictions, so some of the gap ",
-"could be model bias present from the start rather than ageing of the ",
-"estimates; the earliest window, already at %s, is consistent with a small ",
-"constant component of that kind.\n\n"), fmt(cp$pooled$ratio[1], 2)))
-
-cat(paste0(
-"**For a forecasting system.** Use recalibrated Italian curves rather than the ",
-"published ones; debias the temperature forecasts before converting them into ",
-"deaths, since the warm bias on hot days inflates predicted deaths at short ",
-"leads; and treat the output as a ranking of episode severity, which is well ",
-"calibrated, more than as an exact death count, which is not.\n\n"))
 ```
 
-# Limitations
+Limitations:
 
 - **Place of residence.** Istat counts deaths by comune of residence, not of
   occurrence, as do the mortality series used by Masselot et al.
-- **Same-day attribution.** The published curves are overall cumulative
-  effects over lags 0-`r cfg$lag_max`. Test B attributes each day's
-  cumulative risk to that day; episode windows include
-  `r cfg$tail_days` extra days to absorb most of the lagged deaths, and the
-  post-episode excess is reported to show displacement.
 - **Exposure.** Our series is taken at the city point, Masselot's is a
   city-polygon average; the difference is measured and
   `r if (isTRUE(cfg$bias_correct)) "removed as a monthly mean" else "not corrected"`.
   Forecasts come from a coarser model grid than ERA5-Land.
-- **Uncertainty.** `r if (isTRUE(cfg$use_coef_simu)) "Published coefficient draws (coef_simu.csv) keep the correlation between age groups and cities." else "Coefficient draws come from vcov.csv, which ignores the correlation between age groups and between cities; national intervals are therefore too narrow. Setting use_coef_simu = TRUE fixes this."`
 - **Power.** With about three and a half years, small cities cannot support
   the first-stage model and are left to the pooled analyses and test B.
 - **Post-pandemic period.** 2023 still carried residual effects of
   COVID-19 and of the mortality deficit that followed it; the spline of time
   absorbs slow changes but not short epidemics during episodes.
-- **Recalibration.** The recalibrated curves are fitted on all deaths aged 20+,
-  not by age group, and keep the published cold side inside the baseline;
-  both are refinements for a later version.
 
 # Configuration
 

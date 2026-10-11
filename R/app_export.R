@@ -39,11 +39,15 @@ flumomo_weekly <- function(res, agegrps) {
 #' @param data_end Last day with mortality data.
 #' @param cfg Configuration list.
 #' @param path Destination `.rds`.
+#' @param flumomo_region,flumomo_cities Outputs of the FluMOMO runs.
+#' @param istat_file,mort Mortality inputs.
+#' @param istat_cities Output of [read_istat_cities()]; when given, it decides
+#'   each city's region, so the app's region list matches the report's.
 #' @return `path`.
 export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
                               fc, era5, data_end, cfg, path = "app/app_data.rds",
                               flumomo_region = NULL, flumomo_cities = NULL,
-                              istat_file = NULL, mort = NULL) {
+                              istat_file = NULL, mort = NULL, istat_cities = NULL) {
   ensure_dir(dirname(path))
   codes <- sort(unique(cf$daily$URAU_CODE))
   ct <- cities[URAU_CODE %in% codes]
@@ -68,6 +72,16 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
   idx <- suppressMessages(sf::st_within(pts, nuts))
   ct[, region := vapply(idx, function(i)
     if (length(i)) as.character(nuts$region[i[1]]) else NA_character_, character(1))]
+  # the Istat composition names the region of every comune, so it decides where
+  # a city belongs; the app's region list then matches the report's
+  if (!is.null(istat_cities)) {
+    cr <- city_regions(istat_cities, crosswalk$map)
+    if (!is.null(cr) && nrow(cr)) {
+      ct <- merge(ct, cr[, .(URAU_CODE, region_istat = region)], by = "URAU_CODE",
+                  all.x = TRUE)
+      ct[!is.na(region_istat), region := region_istat][, region_istat := NULL]
+    }
+  }
   ct[is.na(region), region := "(non assegnata)"]
 
   city_geom <- NULL
