@@ -427,12 +427,15 @@ scenario_paths <- function(codes, as_of, horizon, curve_name, debias,
 #' @param as_of Issue date, or `NULL` for a purely historical chart.
 #' @param title,subtitle_extra,caption,ylab Text.
 #' @return A ggplot.
+#' @param obs_linewidth Width of the observed line. 0 draws the shaded areas
+#'   only, and the observed series is then read off their edge, so it is left
+#'   out of the legend rather than shown as an empty key.
 plot_deaths <- function(d, pred, as_of, title, caption, exp_label,
-                        ylab = "Deaths per day", subtitle_extra = NULL) {
+                        ylab = "Deaths per day", subtitle_extra = NULL,
+                        obs_linewidth = 0) {
   total <- round(sum(d$observed - d$expected, na.rm = TRUE))
   span <- sprintf("%s to %s", format(min(d$date), "%d %b"), format(max(d$date), "%d %b %Y"))
-  sub <- sprintf(paste("7-day moving averages. Red: days above the expectation,",
-                       "blue: days below (balance %s, %s)"),
+  sub <- sprintf("7-day moving averages. Balance %s deaths, %s",
                  format(total, big.mark = ","), span)
   if (!is.null(subtitle_extra)) sub <- paste0(sub, ". ", subtitle_extra)
   cols <- c("Observed" = "#1F2933"); cols[exp_label] <- "#2C7FB8"
@@ -440,21 +443,29 @@ plot_deaths <- function(d, pred, as_of, title, caption, exp_label,
     cu <- unique(pred$curve)
     cols[cu] <- c("#B2182B", "#1B7837", "#762A83", "#B35806")[seq_along(cu)]
   }
+  # the observed line is invisible at width 0: no key for it either
+  keys <- if (obs_linewidth > 0) names(cols) else setdiff(names(cols), "Observed")
+  above <- "More deaths than expected"; below <- "Fewer deaths than expected"
+  areas <- c("#C0392B", "#3A8DAE"); names(areas) <- c(above, below)
   p <- ggplot(d, aes(date)) +
-    geom_ribbon(aes(ymin = exp7, ymax = pmax(obs7, exp7)), fill = "#C0392B", alpha = .28) +
-    geom_ribbon(aes(ymin = pmin(obs7, exp7), ymax = exp7), fill = "#3A8DAE", alpha = .18)
+    geom_ribbon(aes(ymin = exp7, ymax = pmax(obs7, exp7), fill = above), alpha = .28) +
+    geom_ribbon(aes(ymin = pmin(obs7, exp7), ymax = exp7, fill = below), alpha = .18)
   if (!is.null(as_of) && as_of >= min(d$date) && as_of <= max(d$date))
     p <- p + geom_vline(xintercept = as.numeric(as_of), colour = "grey45", linetype = "22")
   if (nrow(pred))
     p <- p + geom_line(data = pred, aes(date, pred7, colour = curve), linewidth = .8)
   p + geom_line(aes(y = exp7, colour = exp_label), linewidth = .8, linetype = "22") +
-    geom_line(aes(y = obs7, colour = "Observed"), linewidth = 0) +
-    scale_colour_manual(values = cols, breaks = names(cols),
-                        guide = guide_legend(nrow = 2, byrow = TRUE)) +
+    geom_line(aes(y = obs7, colour = "Observed"), linewidth = obs_linewidth,
+              show.legend = obs_linewidth > 0) +
+    scale_colour_manual(values = cols, breaks = keys,
+                        guide = guide_legend(order = 1, nrow = 2, byrow = TRUE)) +
+    scale_fill_manual(values = areas, breaks = c(above, below),
+                      guide = guide_legend(order = 2, nrow = 2, byrow = TRUE,
+                                           override.aes = list(alpha = c(.28, .18)))) +
     scale_x_date(date_labels = "%d %b", expand = expansion(mult = c(.01, .01))) +
     scale_y_continuous(expand = expansion(mult = c(.05, .12))) +
     labs(title = title, subtitle = wrap_txt(sub, 110), x = NULL, y = ylab,
-         colour = NULL, caption = wrap_txt(caption, 120)) +
+         colour = NULL, fill = NULL, caption = wrap_txt(caption, 120)) +
     theme_minimal(base_size = 13) +
     theme(plot.title = element_text(face = "bold", size = rel(1.2)),
           plot.subtitle = element_text(colour = "grey30", margin = margin(b = 12)),
