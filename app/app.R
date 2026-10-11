@@ -93,16 +93,58 @@ rr_draws <- function(t, spec, curve, nsim) {
   bd %*% t(B) - as.numeric(bd %*% t(Bm))
 }
 
-get_json <- function(url, tries = 3, wait = 4) {
+# Answers already obtained in this session. Switching tab or recomputing asks
+# for the same days again, and a flaky connection should not be paid twice.
+JSON_CACHE <- new.env(parent = emptyenv())
+
+#' Read JSON from a URL, through whichever transport works
+#'
+#' On Windows `jsonlite::fromJSON(url)` goes through base R's `url()`
+#' connection, which fails intermittently against Open-Meteo with
+#' "SSL connect error". The curl package and libcurl use their own TLS stack
+#' and are not affected, so all three are tried in turn before giving up, and
+#' the whole ladder is retried with a growing wait.
+#'
+#' @param url Request URL.
+#' @param tries Rounds over the three transports.
+#' @param wait Base waiting time in seconds (grows with the round).
+#' @return The parsed JSON.
+get_json <- function(url, tries = 3, wait = 3) {
+  hit <- JSON_CACHE[[url]]
+  if (!is.null(hit)) return(hit)
+  readers <- list(
+    curl = function(u) {
+      if (!requireNamespace("curl", quietly = TRUE)) stop("curl non installato")
+      h <- curl::new_handle(connecttimeout = 20L, timeout = 180L)
+      r <- curl::curl_fetch_memory(u, handle = h)
+      if (r$status_code >= 400L) stop("HTTP ", r$status_code)
+      jsonlite::fromJSON(rawToChar(r$content))
+    },
+    libcurl = function(u) {
+      tmp <- tempfile(fileext = ".json"); on.exit(unlink(tmp), add = TRUE)
+      utils::download.file(u, tmp, method = "libcurl", quiet = TRUE, mode = "wb")
+      jsonlite::fromJSON(tmp)
+    },
+    base = function(u) jsonlite::fromJSON(u))
+  last <- NULL
   for (i in seq_len(tries)) {
-    r <- tryCatch(jsonlite::fromJSON(url), error = function(e) e)
-    if (!inherits(r, "error")) {
-      if (isTRUE(r$error)) stop(r$reason)
-      return(r)
+    for (nm in names(readers)) {
+      r <- tryCatch(suppressWarnings(readers[[nm]](url)), error = function(e) e)
+      if (!inherits(r, "error")) {
+        # an Open-Meteo error is a valid JSON body, not a transport failure
+        if (isTRUE(r$error)) stop(r$reason)
+        if (length(ls(JSON_CACHE)) > 2000) rm(list = ls(JSON_CACHE), envir = JSON_CACHE)
+        assign(url, r, envir = JSON_CACHE)
+        return(r)
+      }
+      last <- sprintf("%s: %s", nm, conditionMessage(r))
     }
-    Sys.sleep(wait)
+    Sys.sleep(wait * i)
   }
-  stop("Richiesta non riuscita: ", url)
+  stop("Open-Meteo non raggiungibile dopo ", tries, " tentativi con tre metodi ",
+       "diversi (ultimo errore — ", last, "). Se l'errore è \"SSL connect ",
+       "error\", di solito si tratta della connessione o di un proxy: riprovare ",
+       "fra qualche minuto.")
 }
 
 # ---- temperature ------------------------------------------------------------
@@ -834,12 +876,15 @@ server <- function(input, output, session) {
     temps <- withProgress(message = "Scarico le previsioni", value = 0, {
       setNames(lapply(cds, function(cd) {
         incProgress(1 / length(cds), detail = CITIES[URAU_CODE == cd, name])
-        x <- city_temperature(cd, "fc", as_of, as_of + 1, to, isTRUE(input$debias))
+        # a city whose download fails is dropped, not fatal for the others
+        x <- try(city_temperature(cd, "fc", as_of, as_of + 1, to,
+                                  isTRUE(input$debias)), silent = TRUE)
         # the forecast run also returns the days between the end of ERA5-Land
         # and the issue date; the scenarios are only about what comes after it
-        if (is.null(x) || !nrow(x)) x else x[date > as_of]
+        if (inherits(x, "try-error") || is.null(x) || !nrow(x)) NULL else x[date > as_of]
       }), cds)
     })
+    persi <- setdiff(cds, names(Filter(function(x) !is.null(x) && nrow(x), temps)))
     temps <- Filter(function(x) !is.null(x) && nrow(x), temps)
     if (!length(temps))
       stop("Nessuna previsione disponibile per il ", format(as_of, "%d/%m/%Y"),
@@ -855,6 +900,7 @@ server <- function(input, output, session) {
          titolo = if (input$ambito == "reg") input$regione else input$citta,
          giorni = horizon,
          curva = it_label(curva),
+         persi = sort(CITIES[URAU_CODE %in% persi, name]),
          tmax = max(vapply(temps, function(x) max(x$tmean), 0)))
   })
 
@@ -876,9 +922,12 @@ server <- function(input, output, session) {
       "Intervalli al 95%%: incertezza della curva e del livello atteso. Parte di ",
       "questi decessi \u00e8 anticipata di pochi giorni piuttosto che aggiunta: la ",
       "validazione mostra un eccesso molto minore nelle due settimane successive ",
-      "rispetto a quanto previsto dalle curve.</p>"),
+      "rispetto a quanto previsto dalle curve.%s</p>"),
       r$titolo, format(r$as_of, "%d/%m/%Y"), r$giorni, pct_fmt(p_any), r$tmax,
-      f(1), f(n), r$curva))
+      f(1), f(n), r$curva,
+      if (length(r$persi)) sprintf(
+        " <b>Escluse per mancato scaricamento delle previsioni: %s.</b>",
+        paste(r$persi, collapse = ", ")) else ""))
   })
 
   output$sc_tab <- renderTable({
