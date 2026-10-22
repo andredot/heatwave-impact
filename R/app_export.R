@@ -153,30 +153,6 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
   curves <- bundle_curves(codes, erf, recals, rolling, cfg)
 
   # ---- daily deaths and baseline --------------------------------------------
-    pub <- lapply(stats::setNames(AGE_GROUPS, AGE_GROUPS), function(g) {
-      b <- erf_coef(erf, cd, g)
-      list(beta = b, vcov = erf_vcov(erf, cd, g), mmt = erf_mmt(sp, b))
-    })
-    rec <- list()
-    for (rc in Filter(Negate(is.null), recals)) if (!is.null(rc$curves[[cd]])) {
-      b <- rc$curves[[cd]]$beta
-      rec[[rc$label]] <- list(beta = b, vcov = rc$curves[[cd]]$vcov, mmt = erf_mmt(sp, b))
-    }
-    # rolling curves: one per training window, with the date each window ends
-    rol <- NULL
-    if (!is.null(rolling) && nrow(rolling$windows)) {
-      ids <- rolling$windows$window_id
-      has <- vapply(ids, function(w) !is.null(rolling$curves[[w]][[cd]]), TRUE)
-      if (any(has)) {
-        idx <- rolling$windows[has, .(window_id, train_end, label)]
-        rol <- list(index = idx[order(train_end)],
-                    curves = stats::setNames(lapply(idx$window_id, function(w) {
-                      cv <- rolling$curves[[w]][[cd]]
-                      list(beta = cv$beta, vcov = cv$vcov, mmt = erf_mmt(sp, cv$beta),
-                           source = cv$source)
-                    }), idx$window_id))
-      }
-    }
   # every observed day of every city, so the app can show mortality before the
   # period the counterfactual is fitted on
   deaths_long <- if (!is.null(mort))
