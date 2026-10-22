@@ -57,6 +57,11 @@ an out-of-sample test over later years.
    with the deaths observed above a counterfactual baseline of deaths
    expected without heat, for the published curves and for curves
    re-estimated on Italian data of an earlier period.
+4. **Rolling recalibration** — for `r cfg$region_focus`, a curve refitted for
+   every forecast month on the last `r cfg$rolling$train_years` years of
+   deaths available before it (COVID-19 years skipped), scored out of sample
+   against the published curves, with 95% prediction bands that flag
+   abnormal mortality.
 
 Italian published mortality data end on **`r format(data_end, "%d %B %Y")`**.
 
@@ -561,7 +566,7 @@ if (has_ep) {
 }
 ```
 
-```{r test-b-summary}
+```{r test-b-summary, results='asis'}
 if (has_ep) {
   print(kbl(ev$calibration[, .(Windows = windows, N = n, `Observed heat deaths` = fmt(observed, 0),
                                `Predicted heat deaths` = fmt(predicted, 0),
@@ -570,10 +575,12 @@ if (has_ep) {
                                r = fmt(r), `Skill vs baseline` = pct(deviance_skill),
                                `95% PI coverage` = pct(coverage_95))],
             caption = "Calibration of the published curves (slope 1 = calibrated)"))
+  cat("\n\n")
   print(kbl(ev$by_year[, .(Windows = type, Year = year, N = windows, Cities = cities,
                            Observed = fmt(O, 0), `Expected without heat` = fmt(B, 0),
                            `Observed heat deaths` = fmt(X, 0), `Predicted` = fmt(P, 0),
                            Coverage = pct(coverage_95))], caption = "By year"))
+  cat("\n\n")
   tt <- ev$totals
   print(kbl(data.table(
     Quantity = c("Observed heat deaths, all episodes", "Predicted, published curves",
@@ -672,6 +679,185 @@ if (!is.null(ex)) {
 }
 ```
 
+# Rolling recalibration: `r cfg$region_focus`
+
+```{r roll-setup}
+rl <- tar_read(rolling); re <- tar_read(roll_eval); rx <- tar_read(roll_example)
+has_roll <- !is.null(rl) && nrow(rl$windows) > 0 && !is.null(re)
+rc <- cfg$rolling
+nm_city <- tar_read(cities)[, .(URAU_CODE, name)]
+PUBLISHED_LABEL <- if (!is.null(re)) re$curve_sets[1] else "Published (Masselot et al.)"
+```
+
+A fixed window freezes the level of heat risk at the date it ends, and the
+previous sections show that level kept falling. Here the curves are never
+frozen: for every target month (`r paste(month.abb[rc$target_months], collapse = ", ")`)
+Masselot's first stage is refitted on the last `r rc$train_years` years of
+Istat deaths available *before* that month (`r if (identical(rc$update, "yearly")) "updated once a year, on the deaths up to 31 December" else "updated every month, on the deaths up to the end of the previous month"`),
+skipping `r paste(range(rc$skip_years), collapse = "-")` because of COVID-19,
+and the city fits are pooled and shrunk as in the second stage
+(`r if (identical(rc$pool, "italy")) "every Italian city with enough deaths in the window enters the meta-analysis, and the region's cities are always fitted, whatever their size" else "only the region's cities enter the meta-analysis"`).
+A target whose training years would start before the first Istat year is not
+predicted. The published curves stay the reference: the question is whether
+a curve that tracks the most recent mortality predicts the next month's heat
+deaths better than a curve fitted on 2001-2010.
+
+Every curve is out of sample for the month it is used in, so the scores
+below are what a forecaster would have obtained at the time. The pre-COVID
+years are scored as well, with the same baseline model and Masselot's own
+temperatures; the fixed recalibrated curves of the previous section are
+fitted on those years, so they are compared only in the post-COVID period,
+where they are out of sample too.
+
+```{r roll-targets, results='asis'}
+if (!is.null(rl)) {
+  st <- rl$targets[, .(Months = .N, First = min(key), Last = max(key)), by = .(Status = status)]
+  print(kbl(st, caption = "Target months and their status"))
+  cat("\n\n")
+  if (nrow(rl$windows)) {
+    w <- rl$windows[c(1, .N)]
+    print(kbl(w[, .(`Window ends` = train_end, `Training days` = label,
+                    `Cities pooled` = n_pooled, Pooling = method)],
+              caption = "First and last training window"))
+  }
+}
+```
+
+```{r roll-trajectory, fig.height=7}
+#| fig-cap: "Heat relative risk at P99 (vs the curve's own MMT) of the curve in force in each target month. Grey: 95% interval of the BLUP. Dashed: the published curves, weighted by the window's deaths by age."
+if (has_roll && nrow(rl$summary)) {
+  s <- merge(rl$summary, nm_city, by = "URAU_CODE")
+  s[, era := train_end < as.Date(sprintf("%d-01-01", min(rc$skip_years)))]
+  print(ggplot(s, aes(train_end + 1, rr99, group = era)) +
+    geom_hline(yintercept = 1, colour = "grey80") +
+    geom_ribbon(aes(ymin = rr99_lo, ymax = rr99_hi), fill = "grey80") +
+    geom_line(aes(y = rr99_pub), colour = "firebrick", linetype = 2) +
+    geom_line(colour = "grey20") + geom_point(aes(shape = source), size = 1.2) +
+    facet_wrap(~ name) +
+    labs(x = "Month the curve is used for", y = "RR at P99", shape = "Curve") +
+    theme(legend.position = "bottom"))
+}
+```
+
+```{r roll-calibration, results='asis'}
+if (has_roll) {
+  cl <- re$calibration
+  print(kbl(cl[, .(Period = period, Windows = fifelse(type == "episode", "Episodes", "Summers"),
+                   Subset = subset, Curves = curves, N = n,
+                   Observed = fmt(observed, 0), Predicted = fmt(predicted, 0),
+                   `Obs / pred` = fmt(ratio),
+                   Slope = sprintf("%s (%s-%s)", fmt(slope), fmt(lo), fmt(hi)),
+                   r = fmt(r), MAE = fmt(mae, 1), `95% PI coverage` = pct(coverage_95),
+                   `Above PI` = pct(above_pi))],
+            caption = paste("Observed vs predicted heat deaths by curve set (slope 1 =",
+                            "calibrated). Large episodes: published prediction above",
+                            fmt(re$large_threshold, 1), "deaths.")))
+}
+```
+
+```{r roll-numbers}
+if (has_roll) {
+  allp <- tail(re$periods, 1)
+  g <- function(sub, cur, ty = "episode")
+    re$calibration[period == allp & subset == sub & type == ty & curves == cur]
+  pub_all <- g("All windows", PUBLISHED_LABEL); rol_all <- g("All windows", rl$label)
+  pub_lg <- g("Large episodes", PUBLISHED_LABEL); rol_lg <- g("Large episodes", rl$label)
+  ok_num <- nrow(pub_all) && nrow(rol_all)
+  ok_lg <- nrow(pub_lg) && nrow(rol_lg)
+}
+```
+
+`r if (has_roll && ok_num) sprintf("Over %s (%d episodes of the region), the published curves predict %s heat deaths against %s observed (ratio %s, slope %s); the rolling curves predict %s (ratio %s, slope %s), and %s of the episodes fall inside their 95%% prediction interval against %s with the published curves.", if (allp == "All periods") "all the years scored" else allp, rol_all$n, fmt(pub_all$predicted, 0), fmt(pub_all$observed, 0), fmt(pub_all$ratio), fmt(pub_all$slope), fmt(rol_all$predicted, 0), fmt(rol_all$ratio), fmt(rol_all$slope), pct(rol_all$coverage_95), pct(pub_all$coverage_95)) else ""`
+`r if (has_roll && ok_lg) sprintf("On the large episodes - the ones a warning system exists for - the ratio of observed to predicted goes from %s with the published curves to %s with the rolling ones (slope %s to %s, mean absolute error %s to %s deaths per episode).", fmt(pub_lg$ratio), fmt(rol_lg$ratio), fmt(pub_lg$slope), fmt(rol_lg$slope), fmt(pub_lg$mae, 1), fmt(rol_lg$mae, 1)) else ""`
+
+```{r roll-scatter, fig.height=5.5}
+if (has_roll) {
+  w <- re$windows[type == "episode"]
+  w[, curves := factor(curves, re$curve_sets)]
+  print(ggplot(w, aes(P, X)) + geom_hline(yintercept = 0, colour = "grey85") +
+    geom_abline(colour = "grey40", linetype = 2) +
+    geom_errorbarh(aes(xmin = P_lo, xmax = P_hi), colour = "grey80", height = 0) +
+    geom_point(aes(colour = size, shape = abnormal), alpha = .8) +
+    scale_colour_manual(values = c(Large = "firebrick", Other = "grey40")) +
+    scale_shape_manual(values = c(above = 17, below = 25, within = 16)) +
+    facet_wrap(~ curves, nrow = 1) +
+    labs(x = "Predicted heat deaths", y = "Observed heat deaths (O - B)",
+         colour = "Episode", shape = "Observed vs 95% PI",
+         title = "Episodes of the region, each set of curves",
+         subtitle = "Dashed = perfect calibration. Triangles: observed outside the prediction interval") +
+    theme(legend.position = "bottom"))
+}
+```
+
+```{r roll-largest}
+if (has_roll) {
+  w <- merge(re$windows[type == "episode"], nm_city, by = "URAU_CODE")
+  wide <- dcast(w, period + id + name + start + end + O + B + X + P_pub ~ curves,
+                value.var = "P")
+  top <- wide[order(-P_pub)][seq_len(min(15, .N))]
+  sets <- intersect(re$curve_sets, names(top))
+  for (s in sets) top[, (s) := fifelse(is.na(get(s)), "–", fmt(get(s), 0))]
+  roll_pi <- w[curves == rl$label, .(id, period, `Rolling: in 95% PI` = in_pi)]
+  top <- merge(top, roll_pi, by = c("id", "period"), sort = FALSE)
+  kbl(top[, c("name", "start", "end", "O", "B", "X", sets, "Rolling: in 95% PI"), with = FALSE][
+    , `:=`(O = fmt(O, 0), B = fmt(B, 0), X = fmt(X, 0))],
+    col.names = c("City", "Start", "End", "Observed", "Expected without heat",
+                  "Observed heat deaths", sets, "Rolling: in 95% PI"),
+    caption = "Largest episodes by published prediction: predicted heat deaths by curve set")
+}
+```
+
+```{r roll-by-year, fig.height=4}
+if (has_roll) {
+  by <- re$by_year[type == "episode"]
+  obs <- unique(by[, .(year, X)])[, .(X = X[1]), by = year]
+  print(ggplot(by, aes(factor(year), P, fill = curves)) +
+    geom_col(position = position_dodge(width = .8), width = .75) +
+    geom_point(data = obs, aes(factor(year), X), inherit.aes = FALSE, shape = 23,
+               size = 3, fill = "black") +
+    labs(x = NULL, y = "Heat deaths, all episodes of the year", fill = NULL,
+         title = "Predicted (bars) and observed (diamonds) heat deaths by year") +
+    theme(legend.position = "bottom"))
+}
+```
+
+The figure below is what the app shows as a grey band: for every summer
+day, the 95% prediction interval of the deaths expected with the rolling
+curve in force that day - uncertainty of the curve, of the baseline level,
+and the day-to-day noise of the counts. Days whose observed deaths fall
+outside it are marked: those are abnormal for what the curve expects, either
+because the heat effect was larger than predicted (above) or because
+something other than heat, or a heat effect smaller than predicted, kept
+deaths down (below). In a calibrated system about 2.5% of days fall on each
+side.
+
+```{r roll-example, fig.height=11}
+if (!is.null(rx)) {
+  d <- rx$data
+  d[, flag := factor(flag, c("above", "below", "within"),
+                     c("Above the band", "Below the band", "Within"))]
+  share <- d[, .(above = mean(flag == "Above the band"), below = mean(flag == "Below the band"))]
+  print(ggplot(d, aes(date)) +
+    geom_ribbon(aes(ymin = pi_lo, ymax = pi_hi), fill = "grey80") +
+    geom_line(aes(y = B, colour = "Expected without heat"), linewidth = .5, linetype = 2) +
+    geom_line(aes(y = pred_pub, colour = "Published curves"), linewidth = .5) +
+    geom_line(aes(y = pred, colour = "Rolling curves"), linewidth = .7) +
+    geom_point(aes(y = observed, shape = flag, alpha = flag == "Within"), size = 1.1) +
+    scale_alpha_manual(values = c(`TRUE` = .35, `FALSE` = 1), guide = "none") +
+    scale_shape_manual(values = c(`Above the band` = 17, `Below the band` = 25, Within = 16)) +
+    scale_colour_manual(values = c(`Expected without heat` = "steelblue",
+                                   `Published curves` = "firebrick",
+                                   `Rolling curves` = "#1B7837")) +
+    facet_wrap(~ year, ncol = 2, scales = "free_x") +
+    labs(x = NULL, y = "Deaths per day (20+)", colour = NULL, shape = "Observed",
+         title = sprintf("%s: daily deaths and the 95%% prediction band of the rolling curves",
+                         rx$city),
+         subtitle = sprintf("Grey: 95%% prediction interval. Days above: %s; below: %s",
+                            pct(share$above, 1), pct(share$below, 1))) +
+    theme(legend.position = "bottom"))
+}
+```
+
 # Interpretation and limitations
 
 ```{r interpretation, results='asis'}
@@ -722,6 +908,11 @@ Limitations:
 - **Post-pandemic period.** 2023 still carried residual effects of
   COVID-19 and of the mortality deficit that followed it; the spline of time
   absorbs slow changes but not short epidemics during episodes.
+- **Rolling curves.** `r cfg$rolling$train_years` years of deaths are few for
+  a city on its own: small cities' rolling curves are mostly the pooled
+  curve, and the cold arm of a window is confounded by influenza (only the
+  heat arm is used for the heat deaths). The first post-COVID windows join
+  2017-2019 to the first months of 2023, so they mix two populations.
 
 # Configuration
 

@@ -7,9 +7,13 @@
 #      used (previous-runs archive, up to 7 days ahead).
 #    - ERA5-Land reconstruction: temperatures observed between two dates.
 #
-#  Exposure-response curves: the published ones (Masselot et al. 2023) and
-#  those recalibrated on recent Italian data. Estimates carry a 95% interval
-#  combining the uncertainty of the curve and of the expected level.
+#  Exposure-response curves: the published ones (Masselot et al. 2023), those
+#  recalibrated on a fixed window of Italian data and, where the bundle has
+#  them, rolling curves refitted every month on the last years of deaths
+#  (each day uses the curve available on that day). Estimates carry a 95%
+#  interval combining the uncertainty of the curve and of the expected level;
+#  the grey band of the daily chart adds the noise of the counts, and days
+#  whose observed deaths leave it are marked as abnormal.
 #
 #  EuroMOMO tab: observed deaths against two independent expectations, this
 #  project's and the official FluMOMO code's, for the region or its cities.
@@ -56,6 +60,21 @@ NSIM <- 400
 FC_MAX_LEAD <- 7      # longest lead in the previous-runs archive
 PUB <- "Published (Masselot 2023)"
 COL <- c("#B2182B", "#1B7837", "#762A83", "#B35806")
+# rolling curves: refitted every month on the last years of deaths (NULL in
+# bundles built before they existed)
+ROLL <- BUNDLE$rolling$label
+ROLL_CITIES <- BUNDLE$rolling$cities %||% character()
+# overdispersion of daily deaths by city (1 = Poisson when the bundle lacks it)
+PHI <- if (!is.null(BUNDLE$phi)) setNames(BUNDLE$phi$phi, BUNDLE$phi$URAU_CODE) else
+  numeric()
+BAND_COL <- "grey55"
+
+#' Counts with a quasi-Poisson dispersion (negative binomial; Poisson at 1)
+rnb <- function(mu, phi) {
+  mu <- pmax(mu, 0)
+  if (phi <= 1.001) return(rpois(length(mu), mu))
+  rnbinom(length(mu), mu = pmax(mu, 1e-9), size = pmax(mu, 1e-9) / (phi - 1))
+}
 
 # curve sets already carry English names in the bundle
 it_label <- function(x) x
@@ -237,28 +256,74 @@ city_baseline <- function(code, dates) {
   x[!is.na(B), .(agegroup, date, B, B_logsd, obs)]
 }
 
+#' The curve(s) of one city, age group and curve set over a run of dates
+#'
+#' The published and the fixed recalibrated sets have one curve for every
+#' date. The rolling set has one per training window: each date takes the
+#' curve of the latest window that ended before it (the curve a forecaster had
+#' that day), and dates before the first window take the earliest one. A city
+#' without rolling curves falls back to the last fixed recalibrated set.
+#'
+#' @return List of pieces, each `idx` (positions in `dates`), `cv` (curve),
+#'   `window` and `fallback` (name of the set used instead, if any).
+curve_pieces <- function(cu, curve_name, g, dates) {
+  one <- function(cv, fb = NULL) if (is.null(cv)) list() else
+    list(list(idx = seq_along(dates), cv = cv, window = NA_character_, fallback = fb))
+  if (identical(curve_name, PUB)) return(one(cu$published[[g]]))
+  if (!is.null(ROLL) && identical(curve_name, ROLL)) {
+    rl <- cu$rolling
+    if (is.null(rl) || !length(rl$curves)) {
+      fb <- tail(names(cu$recalibrated), 1)
+      return(if (length(fb)) one(cu$recalibrated[[fb]], fb) else list())
+    }
+    ix <- as.data.table(rl$index)
+    i <- findInterval(as.numeric(dates) - 1, as.numeric(ix$train_end))
+    ids <- ix$window_id[pmax(i, 1L)]
+    return(lapply(unique(ids), function(u)
+      list(idx = which(ids == u), cv = rl$curves[[u]], window = u, fallback = NULL)))
+  }
+  one(cu$recalibrated[[curve_name]])
+}
+
 #' Heat deaths per day for one city and one set of curves, with draws
+#'
+#' Besides the heat deaths, returns draws of the deaths expected without heat
+#' (cold effect kept, as in the chart) and of the total predicted deaths, with
+#' the same baseline multiplier in both, so the grey band of the chart carries
+#' the uncertainty of the curve and of the expected level together.
 city_attributable <- function(code, temps, curve_name, nsim) {
   cu <- BUNDLE$curves[[code]]
   base <- city_baseline(code, temps$date)
   if (is.null(base) || !nrow(base)) return(NULL)
   ages <- unique(base$agegroup)
-  point <- rep(0, nrow(temps)); draws <- matrix(0, nsim, nrow(temps))
+  n <- nrow(temps)
+  point <- rep(0, n); draws <- matrix(0, nsim, n); exp_d <- matrix(0, nsim, n)
+  fallback <- NULL; windows <- character()
   for (g in ages) {
     b <- base[agegroup == g][match(temps$date, date)]
-    cv <- if (identical(curve_name, PUB)) cu$published[[g]] else cu$recalibrated[[curve_name]]
-    if (is.null(cv)) next
-    lr <- rr_draws(temps$tmean, cu$spec, cv, nsim)
-    hot <- temps$tmean >= cv$mmt
-    bmult <- exp(matrix(rnorm(nsim, 0, mean(b$B_logsd, na.rm = TRUE)), nsim, nrow(temps)))
-    pt <- b$B * pmax(exp(as.numeric(basis(temps$tmean, cu$spec) %*% cv$beta) -
-                           as.numeric(basis(cv$mmt, cu$spec) %*% cv$beta)) - 1, 0) * hot
-    point <- point + ifelse(is.na(pt), 0, pt)
-    dr <- sweep(pmax(exp(lr) - 1, 0), 2, b$B * hot, "*") * bmult
-    dr[is.na(dr)] <- 0
-    draws <- draws + dr
+    Bg <- ifelse(is.na(b$B), 0, b$B)
+    # one multiplier per draw, shared by the days: an error in the level
+    bmult <- exp(rnorm(nsim, 0, mean(b$B_logsd, na.rm = TRUE)))
+    pub <- cu$published[[g]]
+    cold_f <- if (is.null(pub)) rep(1, n) else
+      ifelse(temps$tmean < pub$mmt, exp(rr_of(temps$tmean, cu$spec, pub)), 1)
+    exp_d <- exp_d + bmult * matrix(Bg * cold_f, nsim, n, byrow = TRUE)
+    for (pc in curve_pieces(cu, curve_name, g, temps$date)) {
+      cv <- pc$cv; j <- pc$idx
+      if (!is.null(pc$fallback)) fallback <- pc$fallback
+      if (!is.na(pc$window)) windows <- union(windows, pc$window)
+      tj <- temps$tmean[j]
+      hot <- tj >= cv$mmt
+      pt <- Bg[j] * pmax(exp(rr_of(tj, cu$spec, cv)) - 1, 0) * hot
+      point[j] <- point[j] + ifelse(is.na(pt), 0, pt)
+      lr <- rr_draws(tj, cu$spec, cv, nsim)
+      dr <- sweep(pmax(exp(lr) - 1, 0), 2, Bg[j] * hot, "*") * bmult
+      dr[is.na(dr)] <- 0
+      draws[, j] <- draws[, j] + dr
+    }
   }
-  list(point = point, draws = draws,
+  list(point = point, draws = draws, expected_draws = exp_d, total_draws = exp_d + draws,
+       fallback = fallback, windows = windows,
        baseline = base[, .(B = sum(B)), by = date][match(temps$date, date), B],
        observed = base[, .(obs = sum(obs)), by = date][match(temps$date, date), obs])
 }
@@ -432,7 +497,7 @@ scenario_paths <- function(codes, as_of, horizon, curve_name, debias,
 #'   out of the legend rather than shown as an empty key.
 plot_deaths <- function(d, pred, as_of, title, caption, exp_label,
                         ylab = "Deaths per day", subtitle_extra = NULL,
-                        obs_linewidth = 0) {
+                        obs_linewidth = 0, band_label = NULL) {
   total <- round(sum(d$observed - d$expected, na.rm = TRUE))
   span <- sprintf("%s to %s", format(min(d$date), "%d %b"), format(max(d$date), "%d %b %Y"))
   sub <- sprintf("7-day moving averages. Balance %s deaths, %s",
@@ -447,25 +512,46 @@ plot_deaths <- function(d, pred, as_of, title, caption, exp_label,
   keys <- if (obs_linewidth > 0) names(cols) else setdiff(names(cols), "Observed")
   above <- "More deaths than expected"; below <- "Fewer deaths than expected"
   areas <- c("#C0392B", "#3A8DAE"); names(areas) <- c(above, below)
-  p <- ggplot(d, aes(date)) +
+  alphas <- c(.28, .18)
+  has_band <- !is.null(band_label) && all(c("band_lo", "band_hi") %in% names(d)) &&
+    any(!is.na(d$band_lo))
+  p <- ggplot(d, aes(date))
+  if (has_band) {
+    # drawn first, so the coloured areas and the lines sit on top of it
+    areas <- c(areas, setNames(BAND_COL, band_label)); alphas <- c(alphas, .35)
+    p <- p + geom_ribbon(data = d[!is.na(band_lo)],
+                         aes(ymin = band_lo, ymax = band_hi, fill = band_label), alpha = .35)
+  }
+  p <- p +
     geom_ribbon(aes(ymin = exp7, ymax = pmax(obs7, exp7), fill = above), alpha = .28) +
     geom_ribbon(aes(ymin = pmin(obs7, exp7), ymax = exp7, fill = below), alpha = .18)
   if (!is.null(as_of) && as_of >= min(d$date) && as_of <= max(d$date))
     p <- p + geom_vline(xintercept = as.numeric(as_of), colour = "grey45", linetype = "22")
   if (nrow(pred))
     p <- p + geom_line(data = pred, aes(date, pred7, colour = curve), linewidth = .8)
-  p + geom_line(aes(y = exp7, colour = exp_label), linewidth = .8, linetype = "22") +
+  p <- p + geom_line(aes(y = exp7, colour = exp_label), linewidth = .8, linetype = "22") +
     geom_line(aes(y = obs7, colour = "Observed"), linewidth = obs_linewidth,
-              show.legend = obs_linewidth > 0) +
+              show.legend = obs_linewidth > 0)
+  # days whose observed deaths leave the grey band: abnormal for that range.
+  # Triangles point the way they left it; the caption says so, which keeps a
+  # third legend off a top strip that is already full.
+  shapes <- c(above = 24, below = 25)
+  if (has_band && "flag" %in% names(d) && any(!is.na(d$flag))) {
+    p <- p + geom_point(data = d[!is.na(flag)], aes(y = obs7, shape = flag),
+                        colour = "#1F2933", fill = "#1F2933", size = 2.2,
+                        show.legend = FALSE) +
+      scale_shape_manual(values = shapes, guide = "none")
+  }
+  p +
     scale_colour_manual(values = cols, breaks = keys,
                         guide = guide_legend(order = 1, nrow = 2, byrow = TRUE)) +
-    scale_fill_manual(values = areas, breaks = c(above, below),
-                      guide = guide_legend(order = 2, nrow = 2, byrow = TRUE,
-                                           override.aes = list(alpha = c(.28, .18)))) +
+    scale_fill_manual(values = areas, breaks = names(areas),
+                      guide = guide_legend(order = 2, nrow = 3, byrow = TRUE,
+                                           override.aes = list(alpha = alphas))) +
     scale_x_date(date_labels = "%d %b", expand = expansion(mult = c(.01, .01))) +
     scale_y_continuous(expand = expansion(mult = c(.05, .12))) +
     labs(title = title, subtitle = wrap_txt(sub, 110), x = NULL, y = ylab,
-         colour = NULL, fill = NULL, caption = wrap_txt(caption, 120)) +
+         colour = NULL, fill = NULL, shape = NULL, caption = wrap_txt(caption, 120)) +
     theme_minimal(base_size = 13) +
     theme(plot.title = element_text(face = "bold", size = rel(1.2)),
           plot.subtitle = element_text(colour = "grey30", margin = margin(b = 12)),
@@ -515,11 +601,22 @@ city_temperature_span <- function(code, from, to, as_of, debias) {
 #' @param baseline `"project"` (our counterfactual) or `"flumomo"`.
 #' @param scope `"cities"` or `"region"` (only with the FluMOMO baseline).
 #' @param nsim Draws.
-#' @return List with `daily`, `pred`, `temps`.
+#' @param band Grey band: `"pred"` = 95% range of the deaths predicted with the
+#'   first curve set, `"exp"` = 95% range of the deaths expected without heat,
+#'   `"none"`. The range carries the uncertainty of the curve and of the
+#'   expected level plus the day-to-day noise of the counts (negative
+#'   binomial with the baseline's overdispersion), summed over the cities and
+#'   smoothed like the observed series, so a 7-day mean of observed deaths
+#'   outside it is abnormal for that expectation.
+#' @return List with `daily` (with `band_lo`, `band_hi`, `flag` when a band is
+#'   asked for), `pred`, `att`, `temps`, `by_city`, `fallback`.
 combined_series <- function(codes, from, to, as_of, curve_names, debias,
-                            baseline = "project", scope = "cities", nsim = NSIM) {
+                            baseline = "project", scope = "cities", nsim = NSIM,
+                            band = "none") {
   dates <- seq(from, to, by = "day")
   temps <- list(); base <- NULL; pred <- list(); attr_tot <- list(); att_city <- list()
+  band_acc <- matrix(0, nsim, length(dates)); band_n <- integer(length(dates))
+  fallback <- list()
   for (cd in codes) {
     tt <- city_temperature_span(cd, from, to, as_of, debias)
     if (is.null(tt) || !nrow(tt)) next
@@ -547,8 +644,18 @@ combined_series <- function(codes, from, to, as_of, curve_names, debias,
         data.table(date = tt$date, att = a$point)
       else merge(attr_tot[[nm]], data.table(date = tt$date, a2 = a$point), by = "date",
                  all = TRUE)[, .(date, att = rowSums(cbind(att, a2), na.rm = TRUE))]
-      if (nm == curve_names[1])
+      if (nm == curve_names[1]) {
         att_city[[cd]] <- data.table(code = cd, att = sum(a$point, na.rm = TRUE))
+        if (!is.null(a$fallback)) fallback[[cd]] <- a$fallback
+        if (band != "none") {
+          m <- if (band == "pred") a$total_draws else a$expected_draws
+          ph <- unname(PHI[cd]); if (!length(ph) || is.na(ph)) ph <- 1
+          noisy <- matrix(rnb(as.vector(m), ph), nsim)
+          ix <- match(tt$date, dates); ok <- !is.na(ix) & !is.na(colSums(m))
+          band_acc[, ix[ok]] <- band_acc[, ix[ok]] + noisy[, ok, drop = FALSE]
+          band_n[ix[ok]] <- band_n[ix[ok]] + 1L
+        }
+      }
     }
   }
   if (is.null(base)) return(NULL)
@@ -579,6 +686,18 @@ combined_series <- function(codes, from, to, as_of, curve_names, debias,
   }
   d[, `:=`(obs7 = frollmean(observed, 7, align = "center"),
            exp7 = frollmean(expected, 7, align = "center"))]
+  if (band != "none" && any(band_n > 0)) {
+    # a day counts only when every city contributed to it
+    band_acc[, band_n < max(band_n)] <- NA
+    sm <- t(apply(band_acc, 1, frollmean, 7, align = "center"))
+    q <- function(p) apply(sm, 2, function(x)
+      if (all(is.na(x))) NA_real_ else stats::quantile(x, p, na.rm = TRUE, names = FALSE))
+    d <- merge(d, data.table(date = dates, band_lo = q(.025), band_hi = q(.975)),
+               by = "date", all.x = TRUE)
+    d[, flag := fifelse(!is.na(obs7) & !is.na(band_hi) & obs7 > band_hi, "above",
+                fifelse(!is.na(obs7) & !is.na(band_lo) & obs7 < band_lo, "below",
+                        NA_character_))]
+  }
   for (nm in names(attr_tot)) {
     x <- merge(d[, .(date, expected)], attr_tot[[nm]], by = "date", all.x = TRUE)
     x[is.na(att), att := 0]
@@ -594,7 +713,8 @@ combined_series <- function(codes, from, to, as_of, curve_names, debias,
   list(daily = d[!is.na(exp7)], pred = rbindlist(pred)[!is.na(pred7)],
        att = att[date >= from & date <= to],
        temps = rbindlist(temps, fill = TRUE),
-       by_city = rbindlist(att_city))
+       by_city = rbindlist(att_city), band = band,
+       fallback = unlist(fallback))
 }
 
 # ================================ UI =========================================# ================================ UI =========================================
@@ -636,7 +756,17 @@ ui <- fluidPage(
           conditionalPanel("input.ambito == 'city'",
                            selectInput("citta", "City", choices = sort(CITIES$name))),
           checkboxGroupInput("curve", "Curves", choices = NULL),
-          div(class = "nota", "The scenarios use the first curve set selected."),
+          div(class = "nota", "The scenarios and the grey band use the first curve set selected."),
+          if (!is.null(ROLL)) div(class = "nota", sprintf(paste(
+            "%s: refitted every month on the last %s years of Istat deaths before it",
+            "(%s skipped); each day uses the curve available on that day. Available for",
+            "%d cities; elsewhere the last fixed recalibrated set is used."),
+            ROLL, BUNDLE$rolling$train_years,
+            paste(range(BUNDLE$rolling$skip_years), collapse = "-"), length(ROLL_CITIES))),
+          radioButtons("banda", "Grey band (95% range)",
+                       c("Around the prediction" = "pred",
+                         "Around the expectation without heat" = "exp",
+                         "None" = "none")),
           br(),
           actionButton("vai", "Compute", class = "btn-primary"),
           br(), br(), uiOutput("msg"), div(class = "nota", textOutput("copertura")),
@@ -690,7 +820,9 @@ ui <- fluidPage(
 server <- function(input, output, session) {
 
   observe({
-    nc <- c(PUB, unique(unlist(lapply(BUNDLE$curves, function(x) names(x$recalibrated)))))
+    # the rolling curves first: they drive the scenarios and the grey band
+    nc <- c(ROLL, unique(unlist(lapply(BUNDLE$curves, function(x) names(x$recalibrated)))),
+            PUB)
     updateCheckboxGroupInput(session, "curve", choices = setNames(nc, it_label(nc)),
                              selected = nc)
   })
@@ -712,11 +844,13 @@ server <- function(input, output, session) {
     set.seed(1)
     out <- withProgress(message = "Downloading temperatures", value = .3, {
       combined_series(cds, from, to, as_of, input$curve, isTRUE(input$debias),
-                      baseline = "project", scope = "cities")
+                      baseline = "project", scope = "cities",
+                      band = input$banda %||% "pred")
     })
     if (is.null(out)) stop("No data available for the period chosen.")
     nomi <- sort(CITIES[URAU_CODE %in% cds, name])
     c(out, list(codes = cds, from = from, to = to, as_of = as_of,
+                first_curve = input$curve[1],
                 chiesto_to = input$periodo[2], lead_max = lead_max,
                 titolo = if (input$ambito == "reg") input$regione else input$citta,
                 citta = nomi))
@@ -729,20 +863,37 @@ server <- function(input, output, session) {
 
   output$g_giorno <- renderPlot({
     r <- risultato()
+    first <- it_label(r$first_curve)
+    band_label <- switch(r$band %||% "none",
+                         pred = sprintf("95%% range of the prediction (%s)", first),
+                         exp = "95% range of the expectation without heat",
+                         NULL)
+    fb <- if (length(r$fallback)) sprintf(
+      "No rolling curve for %s: the %s curves are used there",
+      paste(sort(CITIES[URAU_CODE %in% names(r$fallback), name]), collapse = ", "),
+      unique(r$fallback)[1]) else NULL
+    extra <- c(if (r$from < BASELINE_FROM)
+      sprintf(paste("Before %s the expectation is the seasonal profile of the last",
+                    "twelve months of data, not a fitted baseline"),
+              format(BASELINE_FROM, "%d %b %Y")), fb)
     plot_deaths(
       r$daily, r$pred, r$as_of,
       title = sprintf("Daily deaths and heat-attributable prediction \u2014 %s", r$titolo),
       exp_label = "Expected without heat",
-      subtitle_extra = if (r$from < BASELINE_FROM)
-        sprintf(paste("Before %s the expectation is the seasonal profile of the last",
-                      "twelve months of data, not a fitted baseline"),
-                format(BASELINE_FROM, "%d %b %Y")) else NULL,
+      subtitle_extra = if (length(extra)) paste(extra, collapse = ". ") else NULL,
+      band_label = band_label,
       caption = paste0(
         "Cities: ", paste(r$citta, collapse = ", "), ". ",
         "Observed: Istat daily deaths by municipality of residence, ages 20+. ",
         "Expected: seasonal quasi-Poisson model fitted on days without heat, with the ",
         "cold effect added back. Predicted: expected plus heat deaths from each ",
-        "exposure-response function. Temperatures: ERA5-Land up to the issue date ",
+        "exposure-response function. ",
+        if (!is.null(band_label)) paste0(
+          "Grey band: 95% range of the 7-day mean (uncertainty of the curve and of the ",
+          "expected level, plus the day-to-day noise of the counts); triangles mark ",
+          "days whose observed mean falls outside it (pointing up: above, abnormally ",
+          "many deaths; down: below). ") else "",
+        "Temperatures: ERA5-Land up to the issue date ",
         "(vertical line), Open-Meteo forecast afterwards."),
       ylab = "Deaths per day (ages 20+)")
   })
@@ -813,7 +964,10 @@ server <- function(input, output, session) {
     num <- function(x) format(round(x), big.mark = ",")
     att <- if (nrow(r$att)) r$att[, .(value = sum(att, na.rm = TRUE)), by = curve] else
       data.table(curve = character(), value = numeric())
+    fl <- if ("flag" %in% names(d)) d$flag else character()
     list(n_obs = n_obs, n_days = nrow(d),
+         n_above = sum(fl == "above", na.rm = TRUE), n_below = sum(fl == "below", na.rm = TRUE),
+         n_band = if ("band_lo" %in% names(d)) sum(!is.na(d$band_lo) & !is.na(d$obs7)) else 0L,
          observed = if (n_obs) sum(d$observed, na.rm = TRUE) else NA_real_,
          expected = sum(d$expected, na.rm = TRUE),
          excess = if (n_obs) sum(d$observed - d$expected, na.rm = TRUE) else NA_real_,
@@ -837,10 +991,16 @@ server <- function(input, output, session) {
       paste("<p class='nota'>Window shortened: the forecast issued on %s does not",
             "reach %s (at most %d days ahead).</p>"),
       format(r$as_of, "%d/%m/%Y"), format(r$to + 1, "%d/%m/%Y"), r$lead_max) else ""
+    anom <- if (tt$n_band > 0) sprintf(paste0(
+      "<p>Observed 7-day mean outside the grey band (%s): <b>%d</b> days above, ",
+      "<b>%d</b> below, out of %d days with observed deaths.</p>"),
+      if (identical(r$band, "exp")) "expectation without heat"
+      else paste("prediction,", it_label(r$first_curve)),
+      tt$n_above, tt$n_below, tt$n_band) else ""
     HTML(sprintf(paste0(
-      "<p><b>%s</b>, %s to %s: %s, <b>%s</b> expected without heat.</p>%s%s"),
+      "<p><b>%s</b>, %s to %s: %s, <b>%s</b> expected without heat.</p>%s%s%s"),
       r$titolo, format(r$from, "%d/%m/%Y"), format(r$to, "%d/%m/%Y"),
-      oss, num(tt$expected), prev, taglio))
+      oss, num(tt$expected), prev, anom, taglio))
   })
 
   output$tab <- renderTable({
@@ -856,6 +1016,10 @@ server <- function(input, output, session) {
       out <- rbind(out, data.table(
         Quantity = paste("Predicted heat deaths:", tt$att$curve),
         Value = num(tt$att$value)))
+    if (tt$n_band > 0)
+      out <- rbind(out, data.table(
+        Quantity = c("Days above the grey band (abnormal)", "Days below the grey band"),
+        Value = as.character(c(tt$n_above, tt$n_below))))
     out
   }, align = "lr")
 

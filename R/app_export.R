@@ -18,6 +18,50 @@ flumomo_weekly <- function(res, agegrps) {
   d[order(week_start)]
 }
 
+#' Curves of every city in the form the app reads
+#'
+#' @param codes Urban Audit codes.
+#' @param erf Output of [read_erf_bundle()].
+#' @param recals List of [recalibrate_curves()] outputs.
+#' @param rolling Output of [rolling_collect()], or `NULL`.
+#' @param cfg Configuration list.
+#' @return Named list (one element per city): `spec`, `published` (by age
+#'   group), `recalibrated` (by set), `rolling` (`index` of windows with the
+#'   day each ends, `curves` by window), each curve with `beta`, `vcov`, `mmt`.
+bundle_curves <- function(codes, erf, recals, rolling, cfg) {
+  lapply(stats::setNames(codes, codes), function(cd) {
+    sp <- erf_spec(erf, cd, cfg)
+    pub <- lapply(stats::setNames(AGE_GROUPS, AGE_GROUPS), function(g) {
+      b <- erf_coef(erf, cd, g)
+      list(beta = b, vcov = erf_vcov(erf, cd, g), mmt = erf_mmt(sp, b))
+    })
+    rec <- list()
+    for (rc in Filter(Negate(is.null), recals)) if (!is.null(rc$curves[[cd]])) {
+      b <- rc$curves[[cd]]$beta
+      rec[[rc$label]] <- list(beta = b, vcov = rc$curves[[cd]]$vcov, mmt = erf_mmt(sp, b))
+    }
+    # rolling curves: one per training window, with the date each window ends
+    rol <- NULL
+    if (!is.null(rolling) && nrow(rolling$windows)) {
+      ids <- rolling$windows$window_id
+      has <- vapply(ids, function(w) !is.null(rolling$curves[[w]][[cd]]), TRUE)
+      if (any(has)) {
+        idx <- rolling$windows[has, .(window_id, train_end, label)]
+        rol <- list(index = idx[order(train_end)],
+                    curves = stats::setNames(lapply(idx$window_id, function(w) {
+                      cv <- rolling$curves[[w]][[cd]]
+                      list(beta = cv$beta, vcov = cv$vcov, mmt = erf_mmt(sp, cv$beta),
+                           source = cv$source)
+                    }), idx$window_id))
+      }
+    }
+    list(spec = list(knots = sp$knots, bound = sp$bound, degree = sp$degree,
+                     p99 = sp$p99, pred_grid = sp$pred_grid, pred_pct = sp$pred_pct,
+                     hw_threshold = pct_value(erf$tdist[URAU_CODE == cd], cfg$hw_pct)),
+         published = pub, recalibrated = rec, rolling = rol)
+  })
+}
+
 #' Build the data bundle used by the Shiny app
 #'
 #' Everything the app needs, computed once by the pipeline so that the app
@@ -43,11 +87,15 @@ flumomo_weekly <- function(res, agegrps) {
 #' @param istat_file,mort Mortality inputs.
 #' @param istat_cities Output of [read_istat_cities()]; when given, it decides
 #'   each city's region, so the app's region list matches the report's.
+#' @param rolling Output of [rolling_collect()]; its curves are exported city
+#'   by city with the window index, so the app can use, on every date, the
+#'   curve a forecaster would have had then.
 #' @return `path`.
 export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
                               fc, era5, data_end, cfg, path = "app/app_data.rds",
                               flumomo_region = NULL, flumomo_cities = NULL,
-                              istat_file = NULL, mort = NULL, istat_cities = NULL) {
+                              istat_file = NULL, mort = NULL, istat_cities = NULL,
+                              rolling = NULL) {
   ensure_dir(dirname(path))
   codes <- sort(unique(cf$daily$URAU_CODE))
   ct <- cities[URAU_CODE %in% codes]
@@ -102,8 +150,9 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
                                                                preserveTopology = TRUE))
 
   # ---- curves ---------------------------------------------------------------
-  curves <- lapply(stats::setNames(codes, codes), function(cd) {
-    sp <- erf_spec(erf, cd, cfg)
+  curves <- bundle_curves(codes, erf, recals, rolling, cfg)
+
+  # ---- daily deaths and baseline --------------------------------------------
     pub <- lapply(stats::setNames(AGE_GROUPS, AGE_GROUPS), function(g) {
       b <- erf_coef(erf, cd, g)
       list(beta = b, vcov = erf_vcov(erf, cd, g), mmt = erf_mmt(sp, b))
@@ -113,13 +162,21 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
       b <- rc$curves[[cd]]$beta
       rec[[rc$label]] <- list(beta = b, vcov = rc$curves[[cd]]$vcov, mmt = erf_mmt(sp, b))
     }
-    list(spec = list(knots = sp$knots, bound = sp$bound, degree = sp$degree,
-                     p99 = sp$p99, pred_grid = sp$pred_grid, pred_pct = sp$pred_pct,
-                     hw_threshold = pct_value(erf$tdist[URAU_CODE == cd], cfg$hw_pct)),
-         published = pub, recalibrated = rec)
-  })
-
-  # ---- daily deaths and baseline --------------------------------------------
+    # rolling curves: one per training window, with the date each window ends
+    rol <- NULL
+    if (!is.null(rolling) && nrow(rolling$windows)) {
+      ids <- rolling$windows$window_id
+      has <- vapply(ids, function(w) !is.null(rolling$curves[[w]][[cd]]), TRUE)
+      if (any(has)) {
+        idx <- rolling$windows[has, .(window_id, train_end, label)]
+        rol <- list(index = idx[order(train_end)],
+                    curves = stats::setNames(lapply(idx$window_id, function(w) {
+                      cv <- rolling$curves[[w]][[cd]]
+                      list(beta = cv$beta, vcov = cv$vcov, mmt = erf_mmt(sp, cv$beta),
+                           source = cv$source)
+                    }), idx$window_id))
+      }
+    }
   # every observed day of every city, so the app can show mortality before the
   # period the counterfactual is fitted on
   deaths_long <- if (!is.null(mort))
@@ -129,6 +186,10 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
                         B_logsd = if ("B_logsd" %in% names(cf$daily)) B_logsd else 0,
                         tmean, logrr, mmt)]
   data.table::setkey(daily, URAU_CODE, date, agegroup)
+  # overdispersion of daily deaths around the baseline, by city: the Poisson
+  # noise of the grey prediction band
+  phi <- if ("phi" %in% names(cf$daily))
+    cf$daily[, .(phi = sum(B * phi) / max(sum(B), 1e-9)), by = URAU_CODE] else NULL
 
   # ---- systematic forecast error, by city, month and lead -------------------
   # The report shows the forecasts running warm on hot days; since the curve is
@@ -144,6 +205,11 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
     regions = simplify(nuts[, "region"], 1000),
     city_geom = if (!is.null(city_geom)) simplify(city_geom, 500) else NULL,
     curves = curves, daily = daily, deaths_long = deaths_long, delta = check$delta,
+    phi = phi,
+    rolling = if (!is.null(rolling)) list(
+      label = rolling$label, update = rolling$update, train_years = rolling$train_years,
+      skip_years = rolling$skip_years, windows = rolling$windows,
+      cities = names(Filter(function(x) !is.null(x$rolling), curves))) else NULL,
     region = list(
       name = cfg$flumomo$region,
       cities = unique(crosswalk$map[substr(PRO_COM, 1, 3) %in% cfg$flumomo$provinces$prov,

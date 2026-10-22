@@ -96,6 +96,30 @@ cfg <- list(
   example_city  = "Milan",
   example_years = 2024:2026,
 
+  # ---- rolling recalibration: a curve for every forecast month --------------
+  # The published curves are kept as the reference; each target month gets a
+  # curve refitted (Masselot's first stage + BLUPs) on the deaths available
+  # before it. See R/rolling.R.
+  rolling = list(
+    train_years   = 3,            # years of deaths behind each curve
+    skip_years    = 2020:2022,    # COVID-19: never used to train a curve
+    skip_targets  = TRUE,         # ... and not predicted either
+    update        = "monthly",    # "monthly": refitted every target month on the deaths
+                                  # up to the month before; "yearly": once a year, on the
+                                  # deaths up to 31 December of the previous year
+    target_months = 5:9,
+    first_target_year = NULL,     # NULL = as early as the Istat history allows (a target
+                                  # without train_years of data before it is skipped)
+    pool       = "italy",         # cities in the meta-analysis: "italy" (every city with
+                                  # min_deaths in the window, plus the scope) or "region"
+    min_deaths = 5000,            # Masselot's threshold, for the pooled cities only
+    scope      = "region",        # cities given curves, scored and exported to the app:
+                                  # "region" (region_focus) or "all"
+    large_quantile = 2 / 3,       # episodes above this quantile of the published
+                                  # prediction are "large"
+    label = "Rolling 3-year Italian curves"
+  ),
+
   # ---- counterfactual baseline: deaths expected without heat --------------
   baseline_exclude_months = c(12, 1, 2, 3),  # influenza season, not used to fit the baseline
   baseline_hot_lag   = 3,     # days after a day above the MMT also excluded

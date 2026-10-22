@@ -125,6 +125,43 @@ list(
   tar_target(fc_impact, forecast_episode_impact(counterfactual, cf_eval, forecasts,
                                                 era5_test, exposure_check, erf, config)),
 
+  # ---- 2C. rolling recalibration: one curve per forecast month --------------
+  # cities that get curves, scores and the app export (the region by default)
+  tar_target(roll_codes, if (identical(config$rolling$scope, "all")) cities$URAU_CODE
+                         else region_codes),
+  # cities entering each window's meta-analysis
+  tar_target(roll_pool, if (identical(config$rolling$pool, "region")) roll_codes
+                        else cities$URAU_CODE),
+  # Masselot's own temperatures to 2019, our aligned series from 2020
+  tar_target(roll_expo, rolling_exposure(era5_masselot, exposure_test)),
+  tar_target(roll_plan, rolling_windows(min(mort$date), data_end, config)),
+  tar_target(roll_windows, roll_plan$windows, iteration = "list"),
+  # one branch per training window: cached, so a new Istat release only fits
+  # the windows it changes
+  tar_target(roll_fits, fit_rolling_window(roll_windows, mort, roll_expo, erf, config,
+                                           roll_pool, roll_codes),
+             pattern = map(roll_windows), iteration = "list"),
+  tar_target(rolling, rolling_collect(roll_plan, roll_fits, config)),
+  # pre-COVID years scored too: same baseline model, Masselot's temperatures
+  tar_target(episodes_hist, detect_episodes(era5_masselot[URAU_CODE %in% roll_codes], erf,
+                                            config$repro_start, config$repro_end, config)),
+  tar_target(counterfactual_hist, fit_counterfactual(
+    mort[URAU_CODE %in% roll_codes], era5_masselot[URAU_CODE %in% roll_codes],
+    episodes_hist, erf, config$repro_start, config$repro_end, config)),
+  tar_target(cf_eval_hist, evaluate_counterfactual(counterfactual_hist, config)),
+  tar_target(roll_eval, rolling_evaluation(
+    list(list(label = sprintf("%s-%s", format(config$repro_start, "%Y"),
+                              format(config$repro_end, "%Y")),
+              cf = counterfactual_hist, ev = cf_eval_hist, recals = FALSE),
+         list(label = sprintf("%s-%s", format(periods$test$start, "%Y"),
+                              format(periods$test$end, "%Y")),
+              cf = counterfactual, ev = cf_eval, recals = TRUE)),
+    rolling, recal_curves, erf, config, roll_codes)),
+  tar_target(roll_example, rolling_example(
+    list(list(label = "pre-COVID", cf = counterfactual_hist),
+         list(label = "post-COVID", cf = counterfactual)),
+    rolling, erf, cities, config, roll_codes)),
+
   # ---- regional excess mortality (official FluMOMO code) --------------------
   tar_target(influenza_file, build_influenza_activity(config), format = "file"),
   tar_target(flumomo_code, download_flumomo(config), format = "file"),
@@ -153,7 +190,7 @@ list(
                                          forecasts, era5_test, data_end, config,
                                          "app/app_data.rds",
                                          flumomo_results, flumomo_cities, istat_file,
-                                         mort, istat_cities),
+                                         mort, istat_cities, rolling),
              format = "file"),
 
   # ---- report ---------------------------------------------------------------

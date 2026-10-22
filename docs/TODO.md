@@ -156,3 +156,44 @@ Still to do:
   earlier Urban Audit releases and not one in 2021. It could be added by hand
   (one comune) through `data/raw/crosswalk_overrides.csv` if the city matters, but
   the override path currently needs the city to have a candidate polygon too.
+
+## 7. Rolling recalibration and prediction bands (Lombardy first)
+Status: FIRST VERSION (branch rolling-recalibration-lombardy). Not yet run on the
+real data.
+
+What it does:
+- `R/rolling.R`: for every target month (May-September by default) Masselot's first
+  stage is refitted on the last `rolling$train_years` (3) years of Istat deaths
+  available before that month, skipping 2020-2022, and pooled/shrunk with the BLUPs.
+  A target without three years of Istat data before it (anything before May 2014
+  with the current file) is skipped. The time trend is one natural spline per
+  contiguous block of training days, so a window spanning 2019 -> 2023 does not
+  spend degrees of freedom on the gap. One `targets` branch per training window.
+- `R/rolling_eval.R`: published, fixed recalibrated (post-COVID only, where they are
+  out of sample) and rolling curves scored on the same windows with the same
+  uncertainty model (curve draws + baseline level + negative binomial noise).
+  Calibration overall and for "large" episodes (top third by the published
+  prediction, which does not select on observed deaths). Pre-COVID years are
+  scored with a second counterfactual on 2011-2019 (Masselot's temperatures).
+- Prediction bands: `rolling_daily_band()` for the report, and a grey band in the
+  app (around the prediction or around the expectation without heat), with the
+  days whose observed 7-day mean leaves it marked as abnormal.
+- App: rolling curves are the first curve set when the bundle has them; each day
+  uses the curve of the latest window ending before it. Cities without rolling
+  curves (outside the scope) fall back to the last fixed recalibrated set.
+
+To check on the first real run:
+- run time of `roll_fits` with `pool = "italy"` (about 50 windows x 80 cities);
+  `pool = "region"` is the quick option but pools only nine cities;
+- whether the large-episode slope actually moves towards 1: if it does not, the
+  remaining gap is probably displacement within long episodes (Milan 2024: 29 days)
+  rather than the level of the curve, and the next step is a depletion term;
+- whether the grey band covers ~95% of summer days in the pre-COVID years; if it is
+  too narrow, the baseline level uncertainty (B_logsd) is the first suspect.
+- the yardstick itself. In the synthetic check (`tests/test_rolling_synthetic.R`,
+  where the truth is known) the counterfactual baseline came out 3.5% above the true
+  no-heat level in every month, because the published cold arm used as offset did
+  not match the true one; that alone cut the "observed" heat deaths of episodes by
+  ~20% (8,800 vs 10,900 true), so even the right curve looked like over-prediction.
+  On the real data, re-run the evaluation with `baseline_cold_offset = FALSE` and see
+  how much of the remaining gap on large episodes moves.
