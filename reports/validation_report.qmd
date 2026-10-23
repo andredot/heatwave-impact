@@ -801,40 +801,56 @@ if (has_roll) {
 `r if (has_roll && ok_num) sprintf("Over %s (%d episodes of the region), the published curves predict %s heat deaths against %s observed (ratio %s, slope %s); the rolling curves predict %s (ratio %s, slope %s), and %s of the episodes fall inside their 95%% prediction interval against %s with the published curves.", if (allp == "All periods") "all the years scored" else allp, rol_all$n, fmt(pub_all$predicted, 0), fmt(pub_all$observed, 0), fmt(pub_all$ratio), fmt(pub_all$slope), fmt(rol_all$predicted, 0), fmt(rol_all$ratio), fmt(rol_all$slope), pct(rol_all$coverage_95), pct(pub_all$coverage_95)) else ""`
 `r if (has_roll && ok_lg) sprintf("On the large episodes - the ones a warning system exists for - the ratio of observed to predicted goes from %s with the published curves to %s with the rolling ones (slope %s to %s, mean absolute error %s to %s deaths per episode).", fmt(pub_lg$ratio), fmt(rol_lg$ratio), fmt(pub_lg$slope), fmt(rol_lg$slope), fmt(pub_lg$mae, 1), fmt(rol_lg$mae, 1)) else ""`
 
+The calibration chart keeps only the episodes that matter for a warning:
+those whose observed deaths rose above the grey band of deaths expected
+without heat (the upper end of its 95% range), i.e. a significant excess.
+Selecting on the observed deaths favours episodes where chance pushed deaths
+up, so on this subset any set of curves looks a little low; the comparison
+between the two sets is what matters here, and the warning table at the end
+of the report scores all episodes, with or without excess.
+
 ```{r roll-scatter, fig.height=5.5}
 if (has_roll) {
-  w <- re$windows[type == "episode"]
-  w[, curves := factor(curves, re$curve_sets)]
+  keep_sets <- c(PUBLISHED_LABEL, rl$label)
+  w <- re$windows[type == "episode" & obs_sig == TRUE & curves %in% keep_sets]
+  w[, curves := factor(curves, keep_sets)]
+  sl <- re$calibration[period == tail(re$periods, 1) & type == "episode" &
+                         subset == "Episodes with significant excess" & curves %in% keep_sets]
+  sl[, curves := factor(curves, keep_sets)]
   print(ggplot(w, aes(P, X)) + geom_hline(yintercept = 0, colour = "grey85") +
     geom_abline(colour = "grey40", linetype = 2) +
-    geom_errorbarh(aes(xmin = P_lo, xmax = P_hi), colour = "grey80", height = 0) +
+    geom_abline(data = sl, aes(slope = slope, intercept = 0), colour = "firebrick") +
+    geom_errorbar(aes(ymin = pi_lo - B, ymax = pi_hi - B), colour = "grey80", width = 0) +
     geom_point(aes(colour = size, shape = abnormal), alpha = .8) +
     scale_colour_manual(values = c(Large = "firebrick", Other = "grey40")) +
     scale_shape_manual(values = c(above = 17, below = 25, within = 16)) +
     facet_wrap(~ curves, nrow = 1) +
     labs(x = "Predicted heat deaths", y = "Observed heat deaths (O - B)",
          colour = "Episode", shape = "Observed vs 95% PI",
-         title = "Episodes of the region, each set of curves",
-         subtitle = "Dashed = perfect calibration. Triangles: observed outside the prediction interval") +
+         title = sprintf("Episodes with a significant excess of deaths (%d)", uniqueN(w$id)),
+         subtitle = paste("Dashed = perfect calibration; red = fitted slope. Vertical bars:",
+                          "95% prediction range of the heat deaths")) +
     theme(legend.position = "bottom"))
 }
 ```
 
 ```{r roll-largest}
 if (has_roll) {
-  w <- merge(re$windows[type == "episode"], nm_city, by = "URAU_CODE")
-  wide <- dcast(w, period + id + name + start + end + O + B + X + P_pub ~ curves,
-                value.var = "P")
-  top <- wide[order(-P_pub)][seq_len(min(15, .N))]
-  sets <- intersect(re$curve_sets, names(top))
-  for (s in sets) top[, (s) := fifelse(is.na(get(s)), "–", fmt(get(s), 0))]
-  roll_pi <- w[curves == rl$label, .(id, period, `Rolling: in 95% PI` = in_pi)]
-  top <- merge(top, roll_pi, by = c("id", "period"), sort = FALSE)
-  kbl(top[, c("name", "start", "end", "O", "B", "X", sets, "Rolling: in 95% PI"), with = FALSE][
-    , `:=`(O = fmt(O, 0), B = fmt(B, 0), X = fmt(X, 0))],
-    col.names = c("City", "Start", "End", "Observed", "Expected without heat",
-                  "Observed heat deaths", sets, "Rolling: in 95% PI"),
-    caption = "Largest episodes by published prediction: predicted heat deaths by curve set")
+  w <- merge(re$windows[type == "episode" & curves %in% c(PUBLISHED_LABEL, rl$label)],
+             nm_city, by = "URAU_CODE")
+  pub <- w[curves == PUBLISHED_LABEL, .(period, id, name, start, end, O, B, X, P_pub = P,
+                                        sig = obs_sig)]
+  rol <- w[curves == rl$label, .(period, id, P_roll = P, lo = pi_lo - B, hi = pi_hi - B, in_pi)]
+  top <- merge(pub, rol, by = c("period", "id"))[order(-P_pub)][seq_len(min(15, .N))]
+  kbl(top[, .(name, start, end, fmt(O, 0), fmt(B, 0), fmt(X, 0), fmt(P_pub, 0),
+              fmt(P_roll, 0), sprintf("%s to %s", fmt(lo, 0), fmt(hi, 0)), in_pi,
+              fifelse(sig, "yes", "no"))],
+      col.names = c("City", "Start", "End", "Observed", "Expected without heat",
+                    "Observed heat deaths", "Published", "Rolling",
+                    "Rolling: 95% range", "In range", "Significant excess"),
+      caption = paste("Largest episodes by published prediction: predicted heat deaths and,",
+                      "for the rolling curves, the 95% range the observed heat deaths",
+                      "should fall in"))
 }
 ```
 
@@ -944,6 +960,90 @@ Limitations:
   curve, and the cold arm of a window is confounded by influenza (only the
   heat arm is used for the heat deaths). The first post-COVID windows join
   2017-2019 to the first months of 2023, so they mix two populations.
+
+# Heatwave warnings: significant excess, observed and predicted
+
+```{r warn-setup}
+has_warn <- has_roll && !is.null(re$warnings) && nrow(re$warnings) > 0
+warn_sets <- if (has_roll) c(PUBLISHED_LABEL, rl$label) else character()
+```
+
+The question a warning system answers is binary: will this heatwave push
+deaths above what is normal? For every heatwave episode of
+`r cfg$region_focus` (`r if (has_roll) paste(head(re$periods, -1), collapse = " and ") else ""`):
+
+- a **significant excess was observed** when the episode's deaths exceeded the
+  upper end of the 95% range of deaths expected without heat (the grey band
+  of the app around the expectation: baseline level uncertainty plus the
+  noise of the counts);
+- a **significant excess was predicted** when the deaths expected with the
+  curves (baseline × relative risk) exceeded that same bound.
+
+The predictions use the temperatures that actually occurred, so this is the
+skill of the curves given a perfect temperature forecast; forecast errors
+come on top (section 3).
+
+```{r warn-matrix, results='asis'}
+if (has_warn) {
+  ap <- tail(re$periods, 1)
+  for (cs in warn_sets) {
+    x <- re$warnings[period == ap & curves == cs]
+    if (!nrow(x)) next
+    m <- data.table(` ` = c("Excess predicted", "No excess predicted"),
+                    `Excess observed` = c(x$hits, x$misses),
+                    `No excess observed` = c(x$false_alarms, x$correct_negatives),
+                    Total = c(x$hits + x$false_alarms, x$misses + x$correct_negatives))
+    print(kbl(m, caption = sprintf("%s, %s: %d episodes", cs,
+                                   if (ap == "All periods") "all years scored" else ap, x$n)))
+    cat("\n\n")
+  }
+}
+```
+
+```{r warn-scores, results='asis'}
+if (has_warn) {
+  ws <- re$warnings[curves %in% warn_sets]
+  print(kbl(ws[, .(Period = period, Curves = curves, Episodes = n, Hits = hits,
+                   `False alarms` = false_alarms, Misses = misses,
+                   `Correct negatives` = correct_negatives,
+                   POD = fmt(pod), FAR = fmt(far), CSI = fmt(csi), Bias = fmt(bias),
+                   PSS = fmt(pss), HSS = fmt(hss))],
+            caption = paste("Warning scores. POD: share of observed excesses that were",
+                            "predicted (1 = none missed). FAR: share of predicted excesses",
+                            "that did not happen (0 = no false alarms). CSI: hits / (hits +",
+                            "misses + false alarms). Bias: predicted / observed events",
+                            "(1 = as many warnings as events). PSS and HSS: skill against",
+                            "chance (0 = no skill, 1 = perfect).")))
+  wr <- re$warnings[period == tail(re$periods, 1) & curves == rl$label]
+  wp <- re$warnings[period == tail(re$periods, 1) & curves == PUBLISHED_LABEL]
+}
+```
+
+`r if (has_warn && nrow(wr) && nrow(wp)) sprintf("With the rolling curves, %d of the %d episodes with a significant excess were predicted (POD %s, against %s with the published curves), and %s of the warnings would have been false alarms (FAR %s against %s). The published curves warn %s times as often as excesses happen, the rolling ones %s times.", wr$hits, wr$hits + wr$misses, fmt(wr$pod), fmt(wp$pod), pct(wr$far), fmt(wr$far), fmt(wp$far), fmt(wp$bias), fmt(wr$bias)) else ""`
+
+```{r warn-list}
+if (has_warn) {
+  w <- merge(re$windows[type == "episode" & curves %in% warn_sets], nm_city, by = "URAU_CODE")
+  oc <- function(o, f) fifelse(o & f, "Hit", fifelse(o & !f, "Missed",
+                         fifelse(!o & f, "False alarm", "")))
+  pub <- w[curves == PUBLISHED_LABEL, .(period, id, name, start, end, O, nh_hi, X,
+                                        obs_sig, P_pub = P, out_pub = oc(obs_sig, fc_sig))]
+  rol <- w[curves == rl$label, .(period, id, P_roll = P, lo = pi_lo - B, hi = pi_hi - B,
+                                 out_roll = oc(obs_sig, fc_sig))]
+  wl <- merge(pub, rol, by = c("period", "id"))[
+    obs_sig | out_pub != "" | out_roll != ""][order(start, name)]
+  kbl(wl[, .(name, start, end, fmt(O, 0), fmt(nh_hi, 0), fmt(X, 0),
+             fifelse(obs_sig, "yes", "no"), fmt(P_pub, 0), out_pub, fmt(P_roll, 0),
+             sprintf("%s to %s", fmt(lo, 0), fmt(hi, 0)), out_roll)],
+      col.names = c("City", "Start", "End", "Observed", "No-heat upper bound",
+                    "Observed heat deaths", "Significant excess", "Published",
+                    "Published: warning", "Rolling", "Rolling: 95% range",
+                    "Rolling: warning"),
+      caption = paste("Every episode with a significant excess observed or predicted by either",
+                      "set of curves. Observed: deaths in the episode window (episode +",
+                      cfg$tail_days, "days). Published / Rolling: predicted heat deaths."))
+}
+```
 
 # Configuration
 

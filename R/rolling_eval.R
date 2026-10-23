@@ -164,11 +164,18 @@ score_windows <- function(daily, wins, provider, label, erf, cfg) {
 #' @param erf Output of [read_erf_bundle()].
 #' @param cfg Configuration list.
 #' @param codes Cities evaluated.
-#' @return List with `windows` (long), `calibration` (by period and over all
-#'   periods, all windows and large episodes), `by_year`, `displacement`,
-#'   `large_threshold`, `curve_sets`.
+#' A window has a *significant excess* when its observed deaths exceed the
+#' upper end of the 95% range of deaths expected without heat
+#' ([noheat_band()]); a set of curves *forecasts* one when its expected
+#' deaths E exceed that same bound. The two give the warning contingency
+#' table of `warnings`.
+#'
+#' @return List with `windows` (long, with `nh_lo`, `nh_hi`, `obs_sig`,
+#'   `fc_sig`), `calibration` (by period and over all periods: all windows,
+#'   large episodes, episodes with significant excess), `warnings`,
+#'   `by_year`, `displacement`, `large_threshold`, `curve_sets`.
 rolling_evaluation <- function(sources, roll, recals, erf, cfg, codes) {
-  rows <- list()
+  rows <- list(); nhs <- list()
   recals <- Filter(Negate(is.null), recals)
   for (s in sources) {
     if (is.null(s$ev) || is.null(s$cf)) next
@@ -176,6 +183,7 @@ rolling_evaluation <- function(sources, roll, recals, erf, cfg, codes) {
     if (!nrow(w)) next
     w[, phi := pmax(v / pmax(E, 1e-9), 1)]
     daily <- city_daily(s$cf, codes)
+    nhs[[length(nhs) + 1]] <- noheat_band(w, daily, cfg)[, period := s$label]
     rows[[length(rows) + 1]] <- w[, .(period = s$label, type, id, URAU_CODE, year, start,
                                       end, O, B, X, v_pub = v, phi,
                                       curves = PUBLISHED_LABEL, P, P_lo, P_hi, E, var_E,
@@ -199,6 +207,10 @@ rolling_evaluation <- function(sources, roll, recals, erf, cfg, codes) {
   long[, `:=`(in_pi = O >= pi_lo & O <= pi_hi, z = (O - E) / sqrt(v + var_E),
               abnormal = data.table::fifelse(O > pi_hi, "above",
                                              data.table::fifelse(O < pi_lo, "below", "within")))]
+  # significant excess: deaths above the 95% range of the no-heat expectation,
+  # observed (obs_sig) and predicted by each set of curves (fc_sig)
+  long <- merge(long, data.table::rbindlist(nhs), by = c("period", "type", "id"), all.x = TRUE)
+  long[, `:=`(obs_sig = O > nh_hi, fc_sig = E > nh_hi)]
 
   sz <- long[curves == PUBLISHED_LABEL & type == "episode", .(period, id, P_pub = P)]
   thr <- if (nrow(sz)) stats::quantile(sz$P_pub, cfg$rolling$large_quantile, names = FALSE) else Inf
@@ -233,7 +245,9 @@ rolling_evaluation <- function(sources, roll, recals, erf, cfg, codes) {
       x[type %in% c("episode", "summer"), cal_one(.SD), by = .(type, curves)][
         , subset := "All windows"],
       x[type == "episode" & size == "Large", cal_one(.SD), by = .(type, curves)][
-        , subset := "Large episodes"]), fill = TRUE)[, period := p]
+        , subset := "Large episodes"],
+      x[type == "episode" & obs_sig == TRUE, cal_one(.SD), by = .(type, curves)][
+        , subset := "Episodes with significant excess"]), fill = TRUE)[, period := p]
   }), fill = TRUE)
   cal[, `:=`(curves = factor(curves, ord), period = factor(period, names(groups)))]
   by_year <- long[type %in% c("episode", "summer"),
@@ -243,10 +257,54 @@ rolling_evaluation <- function(sources, roll, recals, erf, cfg, codes) {
   disp <- long[type %in% c("episode", "post"), .(X = sum(X), P = sum(P)),
                by = .(period, type, curves)]
   disp[, curves := factor(curves, ord)]
+  warn <- data.table::rbindlist(lapply(names(groups), function(p)
+    groups[[p]][type == "episode", warning_scores(obs_sig, fc_sig), by = curves][
+      , period := p]))
+  warn[, `:=`(curves = factor(curves, ord), period = factor(period, names(groups)))]
   list(windows = long[], calibration = cal[order(period, subset, type, curves)],
+       warnings = warn[order(period, curves)],
        by_year = by_year[order(type, year, curves)],
        displacement = disp[order(period, curves, type)], large_threshold = thr,
        curve_sets = ord, periods = names(groups))
+}
+
+#' 95% range of a window's deaths if there were no heat
+#'
+#' The deaths expected without heat (B) with the uncertainty of its level and
+#' the negative binomial noise of the counts: observed deaths above its upper
+#' end are a significant excess, whatever the curves say.
+#'
+#' @param wins Windows (`ev$windows` rows) with `B` and `phi`.
+#' @param daily Output of [city_daily()] (for the baseline uncertainty).
+#' @param cfg Configuration list.
+#' @return data.table `type`, `id`, `nh_lo`, `nh_hi`.
+noheat_band <- function(wins, daily, cfg) {
+  set.seed(cfg$seed)
+  data.table::rbindlist(lapply(seq_len(nrow(wins)), function(k) {
+    w <- wins[k]
+    d <- daily[URAU_CODE == w$URAU_CODE & date >= w$start & date <= w$end]
+    if (!nrow(d)) return(NULL)
+    o <- rnb_draw(w$B * exp(stats::rnorm(cfg$nsim, 0, mean(d$B_logsd))), w$phi)
+    q <- stats::quantile(o, c(.025, .975), names = FALSE)
+    data.table::data.table(type = w$type, id = w$id, nh_lo = q[1], nh_hi = q[2])
+  }))
+}
+
+#' Contingency table and skill scores of a yes/no warning
+#'
+#' @param obs,fc Logical: event observed / event forecast.
+#' @return One-row data.table: hits, false alarms, misses, correct negatives,
+#'   probability of detection (POD), false alarm ratio (FAR), critical success
+#'   index (CSI), frequency bias, Peirce (PSS) and Heidke (HSS) skill scores.
+warning_scores <- function(obs, fc) {
+  ok <- !is.na(obs) & !is.na(fc); obs <- obs[ok]; fc <- fc[ok]
+  a <- sum(obs & fc); b <- sum(!obs & fc); c <- sum(obs & !fc); d <- sum(!obs & !fc)
+  dv <- function(x, y) if (y > 0) x / y else NA_real_
+  data.table::data.table(
+    n = a + b + c + d, hits = a, false_alarms = b, misses = c, correct_negatives = d,
+    pod = dv(a, a + c), far = dv(b, a + b), csi = dv(a, a + b + c), bias = dv(a + b, a + c),
+    pss = dv(a, a + c) - dv(b, b + d),
+    hss = dv(2 * (a * d - b * c), (a + c) * (c + d) + (a + b) * (b + d)))
 }
 
 #' Daily prediction band of one city under the rolling curves
