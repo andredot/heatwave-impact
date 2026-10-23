@@ -547,6 +547,37 @@ cf <- tar_read(counterfactual); ev <- tar_read(cf_eval)
 has_ep <- !is.null(ev)
 ```
 
+**Timing check.** Before comparing numbers, the dates themselves are
+checked: within each city and summer, daily excess deaths (observed − B)
+are correlated with the temperature of k days earlier. Deaths should follow
+the heat by 0-2 days; a peak at a negative shift would mean deaths come
+before the temperature that causes them, i.e. a date error somewhere
+between the Istat file and the temperature series.
+
+```{r timing-check, fig.height=3.5}
+tc <- Filter(Negate(is.null), tar_read(timing_check))
+if (length(tc)) {
+  cc <- rbindlist(lapply(names(tc), function(p) cbind(period = p, tc[[p]]$ccf)))
+  pk <- cc[, .SD[which.max(r)], by = period]
+  print(ggplot(cc, aes(lag, r, colour = period)) + geom_vline(xintercept = 0, colour = "grey60") +
+    geom_line() + geom_point(data = pk, size = 2.5) +
+    labs(x = "Days by which deaths follow temperature (negative = deaths first)",
+         y = "Correlation of excess deaths\nwith temperature", colour = NULL) +
+    theme(legend.position = "bottom"))
+  eo <- rbindlist(lapply(names(tc), function(p) if (!is.null(tc[[p]]$episodes))
+    cbind(period = p, tc[[p]]$episodes)))
+}
+```
+
+`r if (length(tc)) sprintf("The correlation peaks at %s. %s", paste(sprintf("%+d days (%s)", pk$lag, pk$period), collapse = " and "), if (nrow(eo)) sprintf("Episode by episode, excess deaths peak a median of %s days after the hottest days (%s of the %d episodes peak before them%s).", fmt(median(eo$offset), 0), pct(mean(eo$offset < 0)), nrow(eo), if (any(eo$offset < 0) && any(eo$offset >= 0)) sprintf("; those last a median of %s days, against %s for the others", fmt(median(eo[offset < 0, ndays]), 0), fmt(median(eo[offset >= 0, ndays]), 0)) else "") else "") else ""`
+A peak at 0 to +2 days says the dates are aligned. Within that, deaths can
+still peak before the hottest days of a *long* episode without any date
+error: the people most vulnerable to heat die in its first days, and later
+days of the same heat find fewer of them (depletion), all the more in the
+first heat of the season. The curves have no memory of how long the heat
+has lasted, so they predict the same risk for the same temperature and peak
+with the temperature.
+
 ```{r test-b-example, fig.height=4.5}
 if (has_ep) {
   big <- ev$windows[type == "summer"][order(-O)][1]

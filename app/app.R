@@ -497,7 +497,8 @@ scenario_paths <- function(codes, as_of, horizon, curve_name, debias,
 #'   out of the legend rather than shown as an empty key.
 plot_deaths <- function(d, pred, as_of, title, caption, exp_label,
                         ylab = "Deaths per day", subtitle_extra = NULL,
-                        obs_linewidth = 0, band_label = NULL) {
+                        obs_linewidth = 0, band_label = NULL,
+                        xlim = NULL) {
   total <- round(sum(d$observed - d$expected, na.rm = TRUE))
   span <- sprintf("%s to %s", format(min(d$date), "%d %b"), format(max(d$date), "%d %b %Y"))
   sub <- sprintf("7-day moving averages. Balance %s deaths, %s",
@@ -548,7 +549,8 @@ plot_deaths <- function(d, pred, as_of, title, caption, exp_label,
     scale_fill_manual(values = areas, breaks = names(areas),
                       guide = guide_legend(order = 2, nrow = 3, byrow = TRUE,
                                            override.aes = list(alpha = alphas))) +
-    scale_x_date(date_labels = "%d %b", expand = expansion(mult = c(.01, .01))) +
+    scale_x_date(date_labels = "%d %b", limits = xlim,
+                 expand = expansion(mult = c(.01, .01))) +
     scale_y_continuous(expand = expansion(mult = c(.05, .12))) +
     labs(title = title, subtitle = wrap_txt(sub, 110), x = NULL, y = ylab,
          colour = NULL, fill = NULL, shape = NULL, caption = wrap_txt(caption, 120)) +
@@ -563,6 +565,51 @@ plot_deaths <- function(d, pred, as_of, title, caption, exp_label,
 }
 
 wrap_txt <- function(x, n = 120) paste(strwrap(x, width = n), collapse = "\n")
+
+#' Daily temperature strip, drawn under the deaths chart on the same dates
+#'
+#' The deaths chart shows 7-day centred means, which spread a short peak over
+#' three days either side; the strip shows the daily temperatures the
+#' predictions are computed from, unsmoothed, so the timing of the heat can be
+#' read directly against the timing of the deaths.
+#'
+#' @param temps data.table `code`, `date`, `tmean`, `source`.
+#' @param xlim Date range of the chart above.
+#' @param as_of Issue date (vertical line), or `NULL`.
+#' @return A ggplot.
+temp_strip <- function(temps, xlim, as_of = NULL) {
+  thr <- mean(vapply(unique(temps$code), function(cd)
+    BUNDLE$curves[[cd]]$spec$hw_threshold %||% NA_real_, 0), na.rm = TRUE)
+  t <- temps[date >= xlim[1] & date <= xlim[2],
+             .(tmean = mean(tmean), source = source[1]), by = date][order(date)]
+  t[, hot := tmean >= thr]
+  lab <- if (uniqueN(temps$code) > 1) "Daily mean temperature, average of the cities (\u00b0C)"
+         else "Daily mean temperature (\u00b0C)"
+  p <- ggplot(t, aes(date, tmean)) +
+    geom_hline(yintercept = thr, colour = "#B2182B", linetype = "22", linewidth = .4) +
+    geom_line(colour = "grey25", linewidth = .6) +
+    geom_point(aes(colour = hot), size = 1.6, show.legend = FALSE) +
+    scale_colour_manual(values = c(`TRUE` = "#B2182B", `FALSE` = "grey25")) +
+    annotate("text", x = xlim[1], y = thr, label = "heatwave threshold (P95)", hjust = 0,
+             vjust = -.5, size = 3, colour = "#B2182B")
+  if (!is.null(as_of) && as_of >= xlim[1] && as_of <= xlim[2])
+    p <- p + geom_vline(xintercept = as.numeric(as_of), colour = "grey45", linetype = "22")
+  p + scale_x_date(date_labels = "%d %b", limits = xlim,
+                   expand = expansion(mult = c(.01, .01))) +
+    labs(x = NULL, y = "\u00b0C", subtitle = paste(lab, "- not smoothed")) +
+    theme_minimal(base_size = 13) +
+    theme(panel.grid.minor = element_blank(), plot.subtitle = element_text(colour = "grey30"),
+          axis.title.y = element_text(colour = "grey30", margin = margin(r = 8)))
+}
+
+#' Draw two charts stacked, with their date axes aligned
+stack_plots <- function(top, bottom, heights = c(3.2, 1)) {
+  g <- rbind(ggplotGrob(top), ggplotGrob(bottom), size = "max")
+  pan <- unique(g$layout$t[grepl("^panel", g$layout$name)])
+  g$heights[pan] <- grid::unit(heights, "null")
+  grid::grid.newpage()
+  grid::grid.draw(g)
+}
 
 #' Temperatures of one city over a period spanning past and future
 #'
@@ -777,7 +824,7 @@ ui <- fluidPage(
           tabsetPanel(
             id = "uscite",
             tabPanel("Summary", br(), uiOutput("sintesi"),
-                     plotOutput("g_giorno", height = "460px"), br(),
+                     plotOutput("g_giorno", height = "640px"), br(),
                      tableOutput("tab")),
             tabPanel("Scenarios", br(), htmlOutput("sc_testo"), br(),
                      uiOutput("sc_vista"), br(), tableOutput("sc_tab")),
@@ -876,13 +923,9 @@ server <- function(input, output, session) {
       sprintf(paste("Before %s the expectation is the seasonal profile of the last",
                     "twelve months of data, not a fitted baseline"),
               format(BASELINE_FROM, "%d %b %Y")), fb)
-    plot_deaths(
-      r$daily, r$pred, r$as_of,
-      title = sprintf("Daily deaths and heat-attributable prediction \u2014 %s", r$titolo),
-      exp_label = "Expected without heat",
-      subtitle_extra = if (length(extra)) paste(extra, collapse = ". ") else NULL,
-      band_label = band_label,
-      caption = paste0(
+    xl <- range(r$daily$date)
+    has_t <- !is.null(r$temps) && nrow(r$temps) > 0
+    cap <- paste0(
         "Cities: ", paste(r$citta, collapse = ", "), ". ",
         "Observed: Istat daily deaths by municipality of residence, ages 20+. ",
         "Expected: seasonal quasi-Poisson model fitted on days without heat, with the ",
@@ -894,8 +937,22 @@ server <- function(input, output, session) {
           "days whose observed mean falls outside it (pointing up: above, abnormally ",
           "many deaths; down: below). ") else "",
         "Temperatures: ERA5-Land up to the issue date ",
-        "(vertical line), Open-Meteo forecast afterwards."),
+        "(vertical line), Open-Meteo forecast afterwards. Lower panel: the daily ",
+        "temperatures the predictions use, unsmoothed; deaths and predictions above ",
+        "are 7-day centred means, so a peak there is spread over three days either side.")
+    # with the temperature strip, the caption goes under it, at the very bottom
+    top <- plot_deaths(
+      r$daily, r$pred, r$as_of, xlim = xl,
+      title = sprintf("Daily deaths and heat-attributable prediction \u2014 %s", r$titolo),
+      exp_label = "Expected without heat",
+      subtitle_extra = if (length(extra)) paste(extra, collapse = ". ") else NULL,
+      band_label = band_label, caption = if (has_t) NULL else cap,
       ylab = "Deaths per day (ages 20+)")
+    if (!has_t) return(print(top))
+    stack_plots(top, temp_strip(r$temps, xl, r$as_of) +
+                  labs(caption = wrap_txt(cap, 120)) +
+                  theme(plot.caption = element_text(colour = "grey45", size = rel(.72), hjust = 0),
+                        plot.caption.position = "plot"))
   })
 
   output$g_cum <- renderPlot({

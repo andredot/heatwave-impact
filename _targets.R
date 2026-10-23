@@ -149,6 +149,10 @@ list(
     mort[URAU_CODE %in% roll_codes], era5_masselot[URAU_CODE %in% roll_codes],
     episodes_hist, erf, config$repro_start, config$repro_end, config)),
   tar_target(cf_eval_hist, evaluate_counterfactual(counterfactual_hist, config)),
+  # do deaths follow temperature in the data? (a date error would show here)
+  tar_target(timing_check, list(
+    `2023 onwards` = lag_check(counterfactual, episodes),
+    `2011-2019` = lag_check(counterfactual_hist, episodes_hist))),
   tar_target(roll_eval, rolling_evaluation(
     list(list(label = sprintf("%s-%s", format(config$repro_start, "%Y"),
                               format(config$repro_end, "%Y")),
