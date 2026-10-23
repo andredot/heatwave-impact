@@ -101,7 +101,8 @@ cfg <- list(
   # curve refitted (Masselot's first stage + BLUPs) on the deaths available
   # before it. See R/rolling.R.
   rolling = list(
-    train_years   = 3,            # years of deaths behind each curve
+    train_years   = 3,            # years of deaths behind each recent curve
+    anchor_years  = 10,           # years behind each city's long-run shape ("shift")
     skip_years    = 2020:2022,    # COVID-19: never used to train a curve
     skip_targets  = TRUE,         # ... and not predicted either
     update        = "monthly",    # "monthly": refitted every target month on the deaths
@@ -117,7 +118,14 @@ cfg <- list(
                                   # "region" (region_focus) or "all"
     large_quantile = 2 / 3,       # episodes above this quantile of the published
                                   # prediction are "large"
-    label = "Rolling 3-year Italian curves"
+    # which set the app and the report's maps use:
+    #   "shift"  each city's curve on the last anchor_years (stable shape) plus the
+    #            change common to all cities over the last train_years (adaptation)
+    #   "window" each city's curve on the last train_years only
+    # Both are always fitted and scored side by side.
+    method = "shift",
+    label = "Rolling 3-year Italian curves",
+    label_shift = "10-year city curves + 3-year Italian shift"
   ),
 
   # ---- counterfactual baseline: deaths expected without heat --------------

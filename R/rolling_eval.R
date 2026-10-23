@@ -159,7 +159,8 @@ score_windows <- function(daily, wins, provider, label, erf, cfg) {
 #'
 #' @param sources List of `list(label, cf, ev, recals)`; `recals = FALSE`
 #'   leaves the fixed recalibrated sets out of that period.
-#' @param roll Output of [rolling_collect()].
+#' @param roll One rolling curve set (`rolling_collect()$window` or `$shift`), or a
+#'   list of them (e.g. the whole output of [rolling_collect()]): each is scored.
 #' @param recals List of [recalibrate_curves()] outputs (fixed windows).
 #' @param erf Output of [read_erf_bundle()].
 #' @param cfg Configuration list.
@@ -176,6 +177,7 @@ score_windows <- function(daily, wins, provider, label, erf, cfg) {
 #'   `by_year`, `displacement`, `large_threshold`, `curve_sets`.
 rolling_evaluation <- function(sources, roll, recals, erf, cfg, codes) {
   rows <- list(); nhs <- list()
+  rolls <- if (!is.null(roll$windows)) list(roll) else Filter(Negate(is.null), roll)
   recals <- Filter(Negate(is.null), recals)
   for (s in sources) {
     if (is.null(s$ev) || is.null(s$cf)) next
@@ -192,8 +194,10 @@ rolling_evaluation <- function(sources, roll, recals, erf, cfg, codes) {
       r <- score_windows(daily, w, curves_fixed(rc), rc$label, erf, cfg)
       if (nrow(r)) rows[[length(rows) + 1]] <- r[, period := s$label]
     }
-    r <- score_windows(daily, w, curves_rolling(roll), roll$label, erf, cfg)
-    if (nrow(r)) rows[[length(rows) + 1]] <- r[, period := s$label]
+    for (rl in rolls) {
+      r <- score_windows(daily, w, curves_rolling(rl), rl$label, erf, cfg)
+      if (nrow(r)) rows[[length(rows) + 1]] <- r[, period := s$label]
+    }
   }
   long <- data.table::rbindlist(rows, use.names = TRUE, fill = TRUE)
   if (!nrow(long)) return(NULL)
@@ -231,7 +235,8 @@ rolling_evaluation <- function(sources, roll, recals, erf, cfg, codes) {
                            above_pi = mean(x$abnormal == "above"),
                            mean_z = mean(x$z))
   }
-  ord <- unique(c(PUBLISHED_LABEL, vapply(recals, `[[`, "", "label"), roll$label))
+  ord <- unique(c(PUBLISHED_LABEL, vapply(recals, `[[`, "", "label"),
+                  vapply(rolls, `[[`, "", "label")))
   ord <- intersect(ord, unique(long$curves))
   pers <- unique(long$period)
   groups <- stats::setNames(lapply(pers, function(p) long[period == p]), pers)

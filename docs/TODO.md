@@ -197,3 +197,23 @@ To check on the first real run:
   ~20% (8,800 vs 10,900 true), so even the right curve looked like over-prediction.
   On the real data, re-run the evaluation with `baseline_cold_offset = FALSE` and see
   how much of the remaining gap on large episodes moves.
+
+### 7b. Stability of the rolling curves in small cities
+Three years are enough for Milan, not for a city with a few deaths a day: its own
+fit is noise and its window BLUP is mostly the pooled curve, moving month to month.
+A longer window with a time trend does not help: the curve read at the end of a
+linear trend over T years has about the variance of a T/4-year window, so ten
+years with a trend is no steadier than three without. What helps is borrowing
+the trend itself, which the validation found to be common to all cities.
+
+Now `rolling_collect()` builds two sets from the same fits, both scored in the report:
+- `window`: city BLUP on the last 3 years (as before);
+- `shift` (default, `rolling$method`): city BLUP on up to `anchor_years` (10) years
+  ending on the last 31 December (one anchor per year, so ~10 extra fits per city)
+  + the change common to all pooled Italian cities between that anchor and the last
+  3 years (meta-analysis of each city's recent-minus-anchor coefficients).
+Synthetic check: month-to-month movement of log RR99 down by about a third, and
+closer to the true risk over all cities. In a world where every city has the same
+risk the heavy shrinkage of the window set is already ideal for small cities, so
+the real-data comparison (report: "Stability of the two rolling sets", calibration
+table) is what should decide `rolling$method`.

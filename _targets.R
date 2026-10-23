@@ -141,7 +141,11 @@ list(
   tar_target(roll_fits, fit_rolling_window(roll_windows, mort, roll_expo, erf, config,
                                            roll_pool, roll_codes),
              pattern = map(roll_windows), iteration = "list"),
-  tar_target(rolling, rolling_collect(roll_plan, roll_fits, config)),
+  # two curve sets from the same fits: "window" and "shift" (see rolling_collect)
+  tar_target(rolling_sets, rolling_collect(roll_plan, roll_fits, config, erf)),
+  # the one the app and the report's maps use
+  tar_target(rolling, if (!is.null(rolling_sets[[config$rolling$method]]))
+    rolling_sets[[config$rolling$method]] else rolling_sets$window),
   # pre-COVID years scored too: same baseline model, Masselot's temperatures
   tar_target(episodes_hist, detect_episodes(era5_masselot[URAU_CODE %in% roll_codes], erf,
                                             config$repro_start, config$repro_end, config)),
@@ -160,7 +164,7 @@ list(
          list(label = sprintf("%s-%s", format(periods$test$start, "%Y"),
                               format(periods$test$end, "%Y")),
               cf = counterfactual, ev = cf_eval, recals = TRUE)),
-    rolling, recal_curves, erf, config, roll_codes)),
+    rolling_sets, recal_curves, erf, config, roll_codes)),
   tar_target(roll_example, rolling_example(
     list(list(label = "pre-COVID", cf = counterfactual_hist),
          list(label = "post-COVID", cf = counterfactual)),

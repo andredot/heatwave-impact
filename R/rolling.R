@@ -34,11 +34,19 @@
 #' year when `skip_targets` is set. Targets that end up with the same training
 #' days share one window, which is fitted once.
 #'
+#' With `anchor_years` larger than `train_years`, every recent window is also
+#' given an *anchor* window: up to `anchor_years` years of deaths (same
+#' skipped years) ending on the last 31 December before the recent window
+#' ends. The anchor gives each city a stable shape; the recent window only
+#' has to say by how much the risk has moved since (see [rolling_collect()]).
+#' Anchors change once a year, so there are few of them.
+#'
 #' @param data_start,data_end First and last day with mortality data.
 #' @param cfg Configuration list (uses `cfg$rolling`).
-#' @return List with `targets` (one row per target month, with `window_id`
-#'   and `status`) and `windows` (list, one element per distinct window:
-#'   `id`, `train_start`, `train_end`, `n_days`, `blocks`, `label`).
+#' @return List with `targets` (one row per target month, with `window_id`,
+#'   `anchor_id` and `status`) and `windows` (list, one element per distinct
+#'   window: `id`, `kind` ("recent" or "anchor"), `train_start`, `train_end`,
+#'   `n_days`, `blocks`, `label`).
 rolling_windows <- function(data_start, data_end, cfg) {
   rc <- cfg$rolling
   skip <- as.integer(rc$skip_years)
@@ -57,28 +65,47 @@ rolling_windows <- function(data_start, data_end, cfg) {
   tg[, `:=`(window_id = NA_character_, status = "ok")]
   if (isTRUE(rc$skip_targets)) tg[year %in% skip, status := "COVID-19 year, not predicted"]
 
-  wins <- list()
-  for (te in sort(unique(tg[status == "ok", train_end]))) {
-    te <- as.Date(te, origin = "1970-01-01")
+  # the last `n` usable days up to `te`, as a window (NULL if fewer than `need`)
+  make_window <- function(te, n, need, id, kind) {
     all_days <- seq(te, data_start, by = "-1 day")
     days <- all_days[!as.integer(format(all_days, "%Y")) %in% skip]
-    if (length(days) < n_days) {
+    if (length(days) < need) return(NULL)
+    days <- sort(days[seq_len(min(n, length(days)))])
+    br <- c(TRUE, diff(as.numeric(days)) > 1)
+    blocks <- data.table::data.table(start = days[br],
+                                     end = days[c(which(br)[-1] - 1, length(days))])
+    list(id = id, kind = kind, train_start = min(days), train_end = te,
+         n_days = length(days), blocks = blocks,
+         label = paste(sprintf("%s to %s", format(blocks$start, "%b %Y"),
+                               format(blocks$end, "%b %Y")), collapse = " + "))
+  }
+  wins <- list()
+  tg[, anchor_id := NA_character_]
+  ay <- if (is.null(rc$anchor_years)) 0 else rc$anchor_years
+  for (te in sort(unique(tg[status == "ok", train_end]))) {
+    te <- as.Date(te, origin = "1970-01-01")
+    id <- format(te, "w%Y%m%d")
+    w <- make_window(te, n_days, n_days, id, "recent")
+    if (is.null(w)) {
       tg[status == "ok" & train_end == te,
          status := sprintf("Istat history too short (needs %d years before %s)",
                            rc$train_years, format(te + 1))]
       next
     }
-    days <- sort(days[seq_len(n_days)])
-    br <- c(TRUE, diff(as.numeric(days)) > 1)
-    blocks <- data.table::data.table(start = days[br],
-                                     end = days[c(which(br)[-1] - 1, length(days))])
-    id <- format(te, "w%Y%m%d")
-    wins[[id]] <- list(
-      id = id, train_start = min(days), train_end = te, n_days = length(days),
-      blocks = blocks,
-      label = paste(sprintf("%s to %s", format(blocks$start, "%b %Y"),
-                            format(blocks$end, "%b %Y")), collapse = " + "))
+    wins[[id]] <- w
     tg[status == "ok" & train_end == te, window_id := id]
+    # anchor: up to anchor_years, ending on the last 31 December of the window
+    aid <- id
+    if (ay > rc$train_years) {
+      ae <- as.Date(sprintf("%d-12-31", as.integer(format(te, "%Y")) -
+                              (format(te, "%m-%d") != "12-31")))
+      cand <- format(ae, "a%Y%m%d")
+      a <- if (!is.null(wins[[cand]])) wins[[cand]] else
+        make_window(ae, round(365.25 * ay), n_days + 1, cand, "anchor")
+      # an anchor no longer than the recent window adds nothing: use the window
+      if (!is.null(a)) { wins[[cand]] <- a; aid <- cand }
+    }
+    tg[status == "ok" & train_end == te, anchor_id := aid]
   }
   list(targets = tg[], windows = unname(wins))
 }
@@ -245,9 +272,13 @@ fit_rolling_window <- function(win, mort, expo, erf, cfg, pool, keep) {
     ages[is.na(ages)] <- 0
     fits[[cd]] <- c(f, list(URAU_CODE = cd, deaths = td, w = ages))
   }
-  out <- list(id = win$id, train_start = win$train_start, train_end = win$train_end,
+  out <- list(id = win$id, kind = if (is.null(win$kind)) "recent" else win$kind,
+              train_start = win$train_start, train_end = win$train_end,
               label = win$label, blocks = bl, n_pooled = length(fits),
-              method = NA_character_, curves = list(), summary = NULL)
+              method = NA_character_, curves = list(), summary = NULL,
+              # each city's own fit, kept for the shift between windows
+              fits = lapply(fits, function(f) list(coef = as.numeric(f$coef), vcov = f$vcov,
+                                                   deaths = f$deaths)))
   if (length(fits) < 3) return(out)
   pm <- pool_mixmeta(do.call(rbind, lapply(fits, `[[`, "coef")),
                      lapply(fits, `[[`, "vcov"))
@@ -299,27 +330,119 @@ rolling_exposure <- function(hist, recent, switch = as.Date("2020-01-01")) {
   x
 }
 
-#' Collect the fitted windows into one object
+#' Common shift of the curves between an anchor and a recent window
+#'
+#' For every city fitted in both windows, the difference of its own
+#' first-stage coefficients (recent - anchor) is pooled in a random-effects
+#' meta-analysis; the pooled difference is the change in risk common to the
+#' cities. The validation found that change to be a common shift (small
+#' heterogeneity between cities), which is what makes it safe to estimate it
+#' from all cities together and to apply it to each one. The two windows
+#' overlap, so the difference of a city's fits is less variable than the sum
+#' of their covariances, which is what is used: the shift's interval is
+#' conservative.
+#'
+#' @param recent,anchor `fits` elements of two [fit_rolling_window()] outputs.
+#' @return List with `beta`, `vcov`, `n` (cities), `method`, or `NULL`.
+rolling_shift <- function(recent, anchor) {
+  cds <- intersect(names(recent), names(anchor))
+  if (!length(cds)) return(NULL)
+  D <- do.call(rbind, lapply(cds, function(cd) recent[[cd]]$coef - anchor[[cd]]$coef))
+  S <- lapply(cds, function(cd) recent[[cd]]$vcov + anchor[[cd]]$vcov)
+  if (length(cds) >= 3) {
+    pm <- pool_mixmeta(D, S)
+    if (!is.null(pm)) return(list(beta = as.numeric(stats::coef(pm$model)),
+                                  vcov = stats::vcov(pm$model), n = length(cds),
+                                  method = pm$method))
+  }
+  # one or two cities: precision-weighted mean
+  P <- lapply(S, function(x) solve((x + t(x)) / 2))
+  V <- solve(Reduce(`+`, P))
+  list(beta = as.numeric(V %*% Reduce(`+`, Map(function(p, d) p %*% d, P,
+                                                  split(D, row(D))))),
+       vcov = V, n = length(cds), method = "fixed")
+}
+
+#' Collect the fitted windows into the rolling curve sets
+#'
+#' Two sets are built from the same fits, one curve per recent window and
+#' city:
+#' \describe{
+#'   \item{window}{the city's BLUP on the recent window alone
+#'     (`train_years` of deaths): follows adaptation closely, but in a small
+#'     city it is mostly the pooled curve, and it moves from month to month;}
+#'   \item{shift}{the city's BLUP on the anchor window (up to `anchor_years`
+#'     of deaths: a stable, city-specific shape) plus the shift common to all
+#'     cities between the anchor and the recent window ([rolling_shift()]),
+#'     estimated on every pooled Italian city, so it is precise even though
+#'     each city has few recent deaths.}
+#' }
 #'
 #' @param plan Output of [rolling_windows()].
 #' @param fits List of [fit_rolling_window()] outputs.
 #' @param cfg Configuration list.
-#' @return List with `label`, `targets`, `windows` (only those with curves),
-#'   `curves` (window id -> code -> curve) and `summary`.
-rolling_collect <- function(plan, fits, cfg) {
+#' @param erf Output of [read_erf_bundle()] (for the RR99 summary of the shift
+#'   set); without it only the window set is built.
+#' @return List with `window` and `shift` (or `NULL`), each with `label`,
+#'   `method`, `targets`, `windows` (recent windows with curves), `curves`
+#'   (window id -> code -> curve) and `summary`; `shift` also has `shifts`
+#'   (one row per window: anchor, cities, pooling method).
+rolling_collect <- function(plan, fits, cfg, erf = NULL) {
   fits <- Filter(function(f) !is.null(f) && length(f$curves), fits)
-  w <- data.table::rbindlist(lapply(fits, function(f) data.table::data.table(
+  kind <- function(f) if (is.null(f$kind)) "recent" else f$kind
+  byid <- stats::setNames(fits, vapply(fits, `[[`, "", "id"))
+  rec <- Filter(function(f) kind(f) == "recent", fits)
+  ids <- vapply(rec, `[[`, "", "id")
+  w <- data.table::rbindlist(lapply(rec, function(f) data.table::data.table(
     window_id = f$id, train_start = f$train_start, train_end = f$train_end,
     label = f$label, n_pooled = f$n_pooled, method = f$method)))
   tg <- data.table::copy(plan$targets)
   if (nrow(w)) tg[status == "ok" & !window_id %in% w$window_id,
                   status := "fewer than 3 cities could be fitted"]
-  list(label = cfg$rolling$label, update = cfg$rolling$update,
-       train_years = cfg$rolling$train_years, skip_years = cfg$rolling$skip_years,
-       targets = tg,
-       windows = if (nrow(w)) w[order(train_end)] else w,
-       curves = stats::setNames(lapply(fits, `[[`, "curves"), vapply(fits, `[[`, "", "id")),
-       summary = data.table::rbindlist(lapply(fits, `[[`, "summary"), fill = TRUE))
+  base <- list(update = cfg$rolling$update, train_years = cfg$rolling$train_years,
+               anchor_years = cfg$rolling$anchor_years,
+               skip_years = cfg$rolling$skip_years, targets = tg,
+               windows = if (nrow(w)) w[order(train_end)] else w)
+  window <- c(base, list(
+    label = cfg$rolling$label, method = "window",
+    curves = stats::setNames(lapply(rec, `[[`, "curves"), ids),
+    summary = data.table::rbindlist(lapply(rec, `[[`, "summary"), fill = TRUE)))
+
+  shift <- NULL
+  anchors <- unique(tg[!is.na(window_id), .(window_id, anchor_id)])
+  if (!is.null(erf) && any(anchors$anchor_id != anchors$window_id, na.rm = TRUE)) {
+    curves <- list(); rows <- list(); sh <- list()
+    for (f in rec) {
+      aid <- anchors[window_id == f$id, anchor_id][1]
+      a <- if (!is.na(aid) && aid != f$id) byid[[aid]] else NULL
+      d <- if (!is.null(a)) rolling_shift(f$fits, a$fits) else NULL
+      cv <- list()
+      for (cd in names(f$curves)) {
+        ac <- if (!is.null(a)) a$curves[[cd]] else NULL
+        cv[[cd]] <- if (is.null(d) || is.null(ac)) f$curves[[cd]] else
+          list(beta = ac$beta + d$beta, vcov = ac$vcov + d$vcov,
+               source = paste(ac$source, "(anchor) + shift"))
+        sp <- erf_spec(erf, cd, cfg)
+        r <- rr99_of(sp, cv[[cd]]$beta, cv[[cd]]$vcov)
+        pub <- f$summary[URAU_CODE == cd, rr99_pub]
+        rows[[length(rows) + 1]] <- data.table::data.table(
+          window_id = f$id, train_end = f$train_end, URAU_CODE = cd,
+          deaths = f$summary[URAU_CODE == cd, deaths][1], source = cv[[cd]]$source,
+          mmt = r$mmt, rr99 = r$rr99, rr99_lo = r$lo, rr99_hi = r$hi,
+          rr99_pub = if (length(pub)) pub[1] else NA_real_)
+      }
+      curves[[f$id]] <- cv
+      sh[[length(sh) + 1]] <- data.table::data.table(
+        window_id = f$id, anchor_id = if (is.null(a)) NA_character_ else a$id,
+        anchor_label = if (is.null(a)) NA_character_ else a$label,
+        cities = if (is.null(d)) 0L else d$n,
+        pooling = if (is.null(d)) "no anchor: window curve" else d$method)
+    }
+    shift <- c(base, list(
+      label = cfg$rolling$label_shift, method = "shift", curves = curves,
+      summary = data.table::rbindlist(rows), shifts = data.table::rbindlist(sh)))
+  }
+  list(window = window, shift = shift)
 }
 
 #' Rolling window in force on each date

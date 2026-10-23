@@ -183,7 +183,8 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
     curves = curves, daily = daily, deaths_long = deaths_long, delta = check$delta,
     phi = phi,
     rolling = if (!is.null(rolling)) list(
-      label = rolling$label, update = rolling$update, train_years = rolling$train_years,
+      label = rolling$label, method = rolling$method, update = rolling$update,
+      train_years = rolling$train_years, anchor_years = rolling$anchor_years,
       skip_years = rolling$skip_years, windows = rolling$windows,
       cities = names(Filter(function(x) !is.null(x$rolling), curves))) else NULL,
     region = list(

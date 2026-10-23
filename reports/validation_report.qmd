@@ -714,6 +714,7 @@ if (!is.null(ex)) {
 
 ```{r roll-setup}
 rl <- tar_read(rolling); re <- tar_read(roll_eval); rx <- tar_read(roll_example)
+rs <- Filter(Negate(is.null), tar_read(rolling_sets))
 has_roll <- !is.null(rl) && nrow(rl$windows) > 0 && !is.null(re)
 rc <- cfg$rolling
 nm_city <- tar_read(cities)[, .(URAU_CODE, name)]
@@ -754,19 +755,61 @@ if (!is.null(rl)) {
 }
 ```
 
-```{r roll-trajectory, fig.height=7}
-#| fig-cap: "Heat relative risk at P99 (vs the curve's own MMT) of the curve in force in each target month. Grey: 95% interval of the BLUP. Dashed: the published curves, weighted by the window's deaths by age."
-if (has_roll && nrow(rl$summary)) {
-  s <- merge(rl$summary, nm_city, by = "URAU_CODE")
+**Two ways to use the recent years.** Three years of deaths are enough for
+Milan, but not for a city with a handful of deaths a day: its own fit is
+mostly noise, so its BLUP is mostly the pooled curve, and it moves from one
+month to the next. Lengthening the window does not solve it: fitting ten
+years with a time trend and reading the curve at the end of the trend is
+about as uncertain as fitting three years, because the trend has to be
+estimated from the same data. What can be borrowed is the trend itself.
+Earlier sections found the fall in heat risk to be a common shift, with
+little difference between cities, so two sets of rolling curves are built
+from the same fits and scored side by side:
+
+- **`r rc$label`** — each city's BLUP on the last `r rc$train_years` years
+  alone;
+- **`r rc$label_shift`** — each city's BLUP on up to `r rc$anchor_years`
+  years of deaths (ending on the last 31 December), which gives it a stable
+  shape of its own, plus the change in the curves between those years and
+  the last `r rc$train_years`, estimated once from every pooled Italian city
+  (a meta-analysis of each city's recent-minus-long-run coefficients) and
+  applied to all.
+
+The app and the maps use the `r if (identical(rc$method, "shift")) rc$label_shift else rc$label`
+(set by `rolling$method`).
+
+```{r roll-trajectory, fig.height=8}
+#| fig-cap: "Heat relative risk at P99 (vs the curve's own MMT) of the curve in force in each target month, both rolling sets. Bands: 95% interval. Dashed: the published curves, weighted by the window's deaths by age."
+if (has_roll && length(rs)) {
+  s <- rbindlist(lapply(rs, function(x) x$summary[, set := x$label]), fill = TRUE)
+  s <- merge(s, nm_city, by = "URAU_CODE")
   s[, era := train_end < as.Date(sprintf("%d-01-01", min(rc$skip_years)))]
-  print(ggplot(s, aes(train_end + 1, rr99, group = era)) +
+  s[, grp := paste(set, era)]
+  cols <- setNames(c("#1B7837", "#2C7FB8")[seq_along(rs)], vapply(rs, `[[`, "", "label"))
+  print(ggplot(s, aes(train_end + 1, rr99, group = grp, colour = set, fill = set)) +
     geom_hline(yintercept = 1, colour = "grey80") +
-    geom_ribbon(aes(ymin = rr99_lo, ymax = rr99_hi), fill = "grey80") +
-    geom_line(aes(y = rr99_pub), colour = "firebrick", linetype = 2) +
-    geom_line(colour = "grey20") + geom_point(aes(shape = source), size = 1.2) +
+    geom_ribbon(aes(ymin = rr99_lo, ymax = rr99_hi), alpha = .15, colour = NA) +
+    geom_line(aes(y = rr99_pub, group = era), colour = "firebrick", linetype = 2) +
+    geom_line() +
+    scale_colour_manual(values = cols) + scale_fill_manual(values = cols) +
     facet_wrap(~ name) +
-    labs(x = "Month the curve is used for", y = "RR at P99", shape = "Curve") +
+    labs(x = "Month the curve is used for", y = "RR at P99", colour = NULL, fill = NULL) +
     theme(legend.position = "bottom"))
+}
+```
+
+```{r roll-stability, results='asis'}
+if (has_roll && length(rs) > 1) {
+  s <- rbindlist(lapply(rs, function(x) x$summary[, set := x$label]), fill = TRUE)
+  setorder(s, set, URAU_CODE, train_end)
+  st <- merge(s[, .(move = mean(abs(diff(log(rr99)))),
+                    width = mean(log(rr99_hi / rr99_lo))), by = .(set, URAU_CODE)],
+              nm_city, by = "URAU_CODE")
+  wide <- dcast(st, name ~ set, value.var = c("move", "width"))
+  for (cl in setdiff(names(wide), "name")) wide[, (cl) := fmt(get(cl), 3)]
+  print(kbl(wide, caption = paste("Stability of the two rolling sets, by city: mean month-to-month",
+                                  "change of log RR99 (move) and mean width of its 95% interval",
+                                  "on the log scale (width). Smaller is steadier.")))
 }
 ```
 

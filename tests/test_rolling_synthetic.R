@@ -78,7 +78,8 @@ mort <- rbindlist(lapply(seq_along(codes), function(k) {
   mmt <- pct_value(tdist[URAU_CODE == cd], 80)
   # 2-day mean temperature drives the risk (a short lag)
   t2 <- frollmean(x$tmean, 2, fill = x$tmean[1])
-  base <- (20 + 25 * k) * (1 + .15 * cos(2 * pi * (doy - 15) / 365.25))
+  # two small cities (4 and 8 deaths a day), as Lecco or Cremona, and larger ones
+  base <- c(4, 8, 40, 70, 100, 150)[k] * (1 + .15 * cos(2 * pi * (doy - 15) / 365.25))
   covid <- ifelse(year(dates) %in% 2020:2022, 1 + .4 * exp(-((doy - 90) / 25)^2), 1)
   mu <- base * covid * exp(true_logrr(t2, mmt, dates))
   rbindlist(lapply(seq_along(ages), function(a)
@@ -101,8 +102,9 @@ check(all(tg[year %in% 2020:2022, status != "ok"]), "COVID years not predicted")
 touch <- vapply(plan$windows, function(w) any(year(seq(min(w$blocks$start), w$train_end, by = "day")[
   in_blocks(seq(min(w$blocks$start), w$train_end, by = "day"), w$blocks)]) %in% 2020:2022), TRUE)
 check(!any(touch), "no training window uses 2020-2022")
-check(all(vapply(plan$windows, `[[`, 0, "n_days") == round(365.25 * 3)), "every window has 3 years of days")
-w24 <- plan$windows[[which(vapply(plan$windows, function(w) w$train_end == as.Date("2024-06-30"), TRUE))]]
+rec_w <- Filter(function(w) w$kind == "recent", plan$windows)
+check(all(vapply(rec_w, `[[`, 0, "n_days") == round(365.25 * 3)), "every recent window has 3 years of days")
+w24 <- rec_w[[which(vapply(rec_w, function(w) w$train_end == as.Date("2024-06-30"), TRUE))]]
 cat("  July 2024 trained on:", w24$label, "\n")
 check(nrow(w24$blocks) == 2, "a post-COVID window is two blocks")
 
@@ -113,13 +115,42 @@ t0 <- Sys.time()
 fits <- lapply(plan$windows, fit_rolling_window, mort = mort, expo = expo, erf = erf, cfg = cfg,
                pool = codes, keep = codes)
 cat(sprintf("  %d windows in %.0f s\n", length(fits), as.numeric(Sys.time() - t0, units = "secs")))
-roll <- rolling_collect(plan, fits, cfg)
-check(nrow(roll$windows) == length(plan$windows), "every window produced curves")
+sets <- rolling_collect(plan, fits, cfg, erf)
+roll <- sets$window; shift <- sets$shift
+n_recent <- sum(vapply(plan$windows, `[[`, "", "kind") == "recent")
+check(nrow(roll$windows) == n_recent, "every recent window produced curves")
+check(!is.null(shift) && any(!is.na(shift$shifts$anchor_id)), "shift set built on anchor windows")
+an <- Filter(function(w) w$kind == "anchor", plan$windows)
+cat("  anchors:", paste(vapply(an, `[[`, "", "label"), collapse = " | "), "\n")
+check(all(vapply(an, `[[`, 0, "n_days") > round(365.25 * 3)), "anchors longer than the recent window")
 s <- roll$summary
 tr <- s[, .(rr = mean(rr99), pub = mean(rr99_pub)), by = .(y = year(train_end))]
 print(tr[order(y)])
 check(tr[y == min(y), rr] > tr[y == max(y), rr], "rolling RR99 falls over time (adaptation)")
 check(all(tr$rr < tr$pub), "rolling RR99 below the (too steep) published one")
+# stability and accuracy of the two sets, against the true RR at P99
+true_rr99 <- function(cd, d) {
+  r <- tdist[URAU_CODE == cd]
+  exp(heat_slope(d) * (pct_value(r, 99) - pct_value(r, 80)))
+}
+cmp <- rbindlist(lapply(list(window = roll, shift = shift), function(x)
+  x$summary[, .(URAU_CODE, train_end, rr99)]), idcol = "set")
+cmp[, truth := mapply(true_rr99, URAU_CODE, train_end + 1)]
+cmp[, small := URAU_CODE %in% codes[1:2]]
+setorder(cmp, set, URAU_CODE, train_end)
+st <- cmp[, .(month_to_month = mean(abs(diff(log(rr99)))),
+              rmse_vs_truth = sqrt(mean((log(rr99) - log(truth))^2))), by = .(set, small)]
+print(st)
+check(st[set == "shift" & small == TRUE, month_to_month] < st[set == "window" & small == TRUE, month_to_month],
+      "small cities: shift curves move less from month to month than window curves")
+# accuracy over all cities. (In this fake world every city has the same true
+# risk, so the heaviest shrinkage - the window BLUP of a small city, which is
+# almost the pooled curve - is the best possible answer for small cities; the
+# shift set gives them their own 10-year shape instead, which only pays off
+# where cities really differ. Accuracy is therefore checked over all cities.)
+acc <- cmp[, .(rmse = sqrt(mean((log(rr99) - log(truth))^2))), by = set]
+check(acc[set == "shift", rmse] < acc[set == "window", rmse],
+      "all cities: shift curves closer to the true risk than window curves")
 check(identical(rolling_lookup(roll, as.Date("2024-07-15")), "w20240630"),
       "lookup: 15 July 2024 uses the window ending 30 June 2024")
 check(is.na(rolling_lookup(roll, as.Date("2021-07-15"))), "lookup: no curve inside the COVID gap")
@@ -138,7 +169,7 @@ recal <- list(recalibrate_curves(mort, hist_expo, erf, c("2016-01-01", "2019-12-
 re <- rolling_evaluation(
   list(list(label = "2011-2019", cf = cf_h, ev = ev_h, recals = FALSE),
        list(label = "2023-2026", cf = cf_t, ev = ev_t, recals = TRUE)),
-  roll, recal, erf, cfg2, codes)
+  sets, recal, erf, cfg2, codes)
 cal <- re$calibration
 print(cal[type == "episode", .(period, subset, curves, n, ratio = round(ratio, 2),
                                slope = round(slope, 2), cover = round(coverage_95, 2))])
@@ -146,9 +177,10 @@ a <- cal[period == "All periods" & subset == "All windows" & type == "episode"]
 check(abs(a[curves == roll$label, ratio] - 1) < abs(a[curves == PUBLISHED_LABEL, ratio] - 1),
       "rolling curves closer to calibration than the published ones")
 lg <- cal[period == "All periods" & subset == "Large episodes" & type == "episode"]
-check(nrow(lg) == 2 && abs(lg[curves == roll$label, slope] - 1) < abs(lg[curves == PUBLISHED_LABEL, slope] - 1),
+check(nrow(lg) >= 2 && abs(lg[curves == roll$label, slope] - 1) < abs(lg[curves == PUBLISHED_LABEL, slope] - 1),
       "large episodes: rolling slope closer to 1")
-check(setequal(unique(re$windows[period == "2011-2019", curves]), c(PUBLISHED_LABEL, roll$label)),
+check(setequal(unique(re$windows[period == "2011-2019", curves]),
+               c(PUBLISHED_LABEL, roll$label, shift$label)),
       "fixed recalibrated curves not scored where they are in sample")
 
 # ---- bands --------------------------------------------------------------------
@@ -165,7 +197,7 @@ ex <- rolling_example(list(list(label = "pre", cf = cf_h), list(label = "post", 
 check(!is.null(ex) && all(c(2014:2019, 2023:2025) %in% ex$data$year), "example covers every scored summer")
 
 out <- Sys.getenv("ROLLING_TEST_OUT")   # keep the objects, e.g. to try the app on them
-if (nzchar(out)) saveRDS(list(roll = roll, re = re, ex = ex, cf_t = cf_t, erf = erf,
+if (nzchar(out)) saveRDS(list(roll = roll, sets = sets, re = re, ex = ex, cf_t = cf_t, erf = erf,
                               codes = codes, cfg = cfg2, tmp = tmp, recal = recal), out)
 cat(if (length(failed)) sprintf("\n%d check(s) failed\n", length(failed)) else "\nall checks passed\n")
 if (length(failed)) quit(status = 1)

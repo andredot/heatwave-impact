@@ -805,11 +805,16 @@ ui <- fluidPage(
           checkboxGroupInput("curve", "Curves", choices = NULL),
           div(class = "nota", "The scenarios and the grey band use the first curve set selected."),
           if (!is.null(ROLL)) div(class = "nota", sprintf(paste(
-            "%s: refitted every month on the last %s years of Istat deaths before it",
-            "(%s skipped); each day uses the curve available on that day. Available for",
-            "%d cities; elsewhere the last fixed recalibrated set is used."),
-            ROLL, BUNDLE$rolling$train_years,
-            paste(range(BUNDLE$rolling$skip_years), collapse = "-"), length(ROLL_CITIES))),
+            "%s: refitted every month on the Istat deaths before it (%s skipped); %s",
+            "Each day uses the curve available on that day. Available for %d cities;",
+            "elsewhere the last fixed recalibrated set is used."),
+            ROLL, paste(range(BUNDLE$rolling$skip_years), collapse = "-"),
+            if (identical(BUNDLE$rolling$method, "shift")) sprintf(paste(
+              "each city keeps the shape of its last %s years, moved by the change",
+              "common to all Italian cities over the last %s."),
+              BUNDLE$rolling$anchor_years, BUNDLE$rolling$train_years)
+            else sprintf("the last %s years only.", BUNDLE$rolling$train_years),
+            length(ROLL_CITIES))),
           radioButtons("banda", "Grey band (95% range)",
                        c("Around the prediction" = "pred",
                          "Around the expectation without heat" = "exp",
