@@ -217,3 +217,26 @@ closer to the true risk over all cities. In a world where every city has the sam
 risk the heavy shrinkage of the window set is already ideal for small cities, so
 the real-data comparison (report: "Stability of the two rolling sets", calibration
 table) is what should decide `rolling$method`.
+
+## 8. Two reports and an all-summers app (branch rolling-recalibration-lombardy)
+Status: FIRST VERSION, checked on simulated data only.
+
+- `reports/adaptation_report.qmd` (paper): every Italian city refitted in consecutive
+  3-year windows (2011-13, 2014-16, 2017-19, 2023-26; COVID years out), BLUPs;
+  RR99 vs published with meta-regression trend (all cities and balanced panel),
+  MMT percentile, heat-attributable fraction standardised to the same summers and
+  deaths, and a curve-free excess-per-degree-day check. Code: `R/adaptation.R`,
+  targets `adaptation`, `dose_response`, `timing_italy`.
+- `reports/system_validation.qmd`: the rolling 3-year curves (published as reference)
+  on Lombardy, 2014-19 + 2023-26, recorded temperatures; MMT, uncertainty,
+  calibration, warnings confusion matrix, readiness verdict against criteria fixed
+  in `cfg$readiness`. Targets `roll_eval`, `roll_example`, `timing_region`, `readiness`.
+- Dropped from the pipeline: fixed 2011-2019 / 2016-2019 curves, the 10-year
+  "shift" variant (still available: `rolling$anchor_years > train_years`), forecast
+  skill and fc_impact (forecast validation comes back in a later version), the old
+  single report. The functions stay in R/ (recalibrate.R, forecast.R,
+  run_period_tests, forecast_episode_impact, flumomo_validation.R) for reuse.
+- Rolling curves now cover every city (`rolling$scope = "all"`) and April
+  (`target_months = 4:9`), and the 2011-2019 counterfactual is fitted for every city:
+  the app shows every summer (1 April - 30 September) from the bundle, without
+  downloads. Expect a longer first `tar_make()`.

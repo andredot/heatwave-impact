@@ -16,11 +16,13 @@ suppressPackageStartupMessages({
   library(data.table); library(dlnm); library(mixmeta); library(splines)
 })
 for (f in c("R/config.R", "R/utils.R", "R/erf.R", "R/curves.R", "R/episodes.R",
-            "R/recalibrate.R", "R/rolling.R", "R/rolling_eval.R")) source(f)
+            "R/recalibrate.R", "R/rolling.R", "R/rolling_eval.R", "R/lag_check.R",
+            "R/adaptation.R")) source(f)
 set.seed(1)
 cfg$nsim <- 200
 cfg$rolling$pool <- "region"
 cfg$rolling$min_deaths <- 0
+cfg$rolling$anchor_years <- 10   # also exercise the "shift" variant
 check <- function(ok, msg) {
   cat(if (isTRUE(ok)) "  ok   " else "  FAIL ", msg, "\n", sep = "")
   if (!isTRUE(ok)) failed <<- c(failed, msg)
@@ -97,7 +99,8 @@ plan <- rolling_windows(min(mort$date), data_end, cfg)
 tg <- plan$targets
 check(all(tg[year == 2013, status != "ok"]) && all(tg[year < 2014, status != "ok"]),
       "targets before 2014 skipped (no three years of history)")
-check(tg[key == "2014-05", status] == "ok", "May 2014 is the first target")
+check(tg[key == "2014-04", status] == "ok" && all(tg[key < "2014-04", status != "ok"]),
+      "April 2014 is the first target")
 check(all(tg[year %in% 2020:2022, status != "ok"]), "COVID years not predicted")
 touch <- vapply(plan$windows, function(w) any(year(seq(min(w$blocks$start), w$train_end, by = "day")[
   in_blocks(seq(min(w$blocks$start), w$train_end, by = "day"), w$blocks)]) %in% 2020:2022), TRUE)
@@ -196,8 +199,40 @@ ex <- rolling_example(list(list(label = "pre", cf = cf_h), list(label = "post", 
                       roll, erf, data.table(URAU_CODE = codes, name = paste("City", 1:6)), cfg2, codes)
 check(!is.null(ex) && all(c(2014:2019, 2023:2025) %in% ex$data$year), "example covers every scored summer")
 
+# ---- adaptation (Report 1) ---------------------------------------------------
+cat("Adaptation\n")
+cfg3 <- cfg2; cfg3$nsim <- 100
+ad <- run_adaptation(mort, hist_expo, test_expo, erf, data_end, cfg3)
+print(ad$pooled[, .(window, k, ratio = round(ratio, 3), lo = round(lo, 3), hi = round(hi, 3))])
+print(ad$af[, .(window, af = round(af, 4), lo = round(lo, 4), hi = round(hi, 4))])
+print(ad$trend)
+check(nrow(ad$pooled) == 4, "four adaptation windows")
+check(ad$pooled$ratio[4] < ad$pooled$ratio[1], "heat RR ratio falls from the first to the last window")
+check(nrow(ad$trend) >= 1 && ad$trend$change_per_decade[1] < 1, "trend per decade below 1")
+check(ad$af$af[1] > max(ad$af$af[-1]), "published curves give the largest standardised AF")
+check(ad$af$af[2] > ad$af$af[5], "standardised AF falls from the first to the last window")
+check(ad$af_trend$change_per_decade < 1, "standardised AF trend below 1")
+dr <- summer_dose_response(list(cf_h, cf_t), erf, cfg3)
+print(dr$slopes)
+check(!is.null(dr) && nrow(dr$slopes) == 4 && all(dr$slopes$slope_pct > 0),
+      "dose-response: one positive slope per window")
+
+# ---- readiness (Report 2) ---------------------------------------------------------
+re1 <- rolling_evaluation(
+  list(list(label = "2011-2019", cf = cf_h, ev = ev_h),
+       list(label = "2023-2026", cf = cf_t, ev = ev_t)),
+  roll, list(), erf, cfg2, codes)
+rd <- readiness_check(re1, list(a = lag_check(cf_h), b = lag_check(cf_t)), roll$label, cfg2)
+print(rd$criteria[, .(id, system, published, pass)]); cat("  verdict:", rd$verdict, "\n")
+check(nrow(rd$criteria) == length(cfg2$readiness) && rd$verdict %in%
+        c("Ready", "Ready with caveats", "Not ready"), "readiness check runs")
+check(setequal(re1$curve_sets, c(PUBLISHED_LABEL, roll$label)), "system validation: published + rolling only")
+
 out <- Sys.getenv("ROLLING_TEST_OUT")   # keep the objects, e.g. to try the app on them
-if (nzchar(out)) saveRDS(list(roll = roll, sets = sets, re = re, ex = ex, cf_t = cf_t, erf = erf,
+if (nzchar(out)) saveRDS(list(roll = roll, sets = sets, re = re, re1 = re1, rd = rd, ad = ad,
+                              dr = dr, lc = list(`2011-2019` = lag_check(cf_h, ep_h),
+                                                 `2023 onwards` = lag_check(cf_t, ep_t)),
+                              cf_h = cf_h, ex = ex, cf_t = cf_t, erf = erf,
                               codes = codes, cfg = cfg2, tmp = tmp, recal = recal), out)
 cat(if (length(failed)) sprintf("\n%d check(s) failed\n", length(failed)) else "\nall checks passed\n")
 if (length(failed)) quit(status = 1)

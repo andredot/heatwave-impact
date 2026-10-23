@@ -87,6 +87,9 @@ bundle_curves <- function(codes, erf, recals, rolling, cfg) {
 #' @param istat_file,mort Mortality inputs.
 #' @param istat_cities Output of [read_istat_cities()]; when given, it decides
 #'   each city's region, so the app's region list matches the report's.
+#' @param cf_hist Counterfactual of the pre-COVID years ([fit_counterfactual()]);
+#'   its March-October days are added to the daily table, so the app can show
+#'   every summer with its own baseline and temperatures, without downloads.
 #' @param rolling Output of [rolling_collect()]; its curves are exported city
 #'   by city with the window index, so the app can use, on every date, the
 #'   curve a forecaster would have had then.
@@ -95,7 +98,7 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
                               fc, era5, data_end, cfg, path = "app/app_data.rds",
                               flumomo_region = NULL, flumomo_cities = NULL,
                               istat_file = NULL, mort = NULL, istat_cities = NULL,
-                              rolling = NULL) {
+                              rolling = NULL, cf_hist = NULL) {
   ensure_dir(dirname(path))
   codes <- sort(unique(cf$daily$URAU_CODE))
   ct <- cities[URAU_CODE %in% codes]
@@ -158,14 +161,21 @@ export_app_bundle <- function(cf, recals, erf, cities, crosswalk, gisco, check,
   deaths_long <- if (!is.null(mort))
     mort[, .(deaths = sum(deaths)), by = .(URAU_CODE, date)][order(URAU_CODE, date)]
   else NULL
-  daily <- cf$daily[, .(URAU_CODE, agegroup, date, deaths, B,
-                        B_logsd = if ("B_logsd" %in% names(cf$daily)) B_logsd else 0,
-                        tmean, logrr, mmt)]
-  data.table::setkey(daily, URAU_CODE, date, agegroup)
+  # pre-COVID summers (with a month of margin for the 7-day means), then the
+  # whole post-COVID period
+  pick <- function(x) x[, .(URAU_CODE, agegroup, date, deaths, B,
+                            B_logsd = if ("B_logsd" %in% names(x)) B_logsd else 0,
+                            tmean, logrr, mmt, phi = if ("phi" %in% names(x)) phi else 1)]
+  dl <- list(pick(cf$daily))
+  if (!is.null(cf_hist) && nrow(cf_hist$daily))
+    dl <- c(list(pick(cf_hist$daily[URAU_CODE %in% codes &
+                                      data.table::month(date) %in% 3:10])), dl)
+  daily <- data.table::rbindlist(dl)
   # overdispersion of daily deaths around the baseline, by city: the Poisson
   # noise of the grey prediction band
-  phi <- if ("phi" %in% names(cf$daily))
-    cf$daily[, .(phi = sum(B * phi) / max(sum(B), 1e-9)), by = URAU_CODE] else NULL
+  phi <- daily[, .(phi = sum(B * phi) / max(sum(B), 1e-9)), by = URAU_CODE]
+  daily[, phi := NULL]
+  data.table::setkey(daily, URAU_CODE, date, agegroup)
 
   # ---- systematic forecast error, by city, month and lead -------------------
   # The report shows the forecasts running warm on hot days; since the curve is

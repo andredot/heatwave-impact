@@ -390,3 +390,55 @@ rolling_example <- function(sources, roll, erf, cities, cfg, codes) {
   if (!length(out)) return(NULL)
   list(data = data.table::rbindlist(out), city = cities[URAU_CODE == cd, name][1])
 }
+
+#' Implementation readiness of the system, against criteria fixed beforehand
+#'
+#' Each criterion of `cfg$readiness` (an accepted range) is evaluated on the
+#' system's curves over all the periods scored together, next to the value of
+#' the published curves for reference. The verdict is "Ready" when every
+#' criterion passes, "Ready with caveats" when only non-core ones fail, and
+#' "Not ready" when a core one fails.
+#'
+#' @param re Output of [rolling_evaluation()].
+#' @param timing Named list of [lag_check()] outputs (one per period).
+#' @param label Label of the system's curve set.
+#' @param cfg Configuration list.
+#' @return List with `criteria` (one row per criterion) and `verdict`.
+readiness_check <- function(re, timing, label, cfg) {
+  if (is.null(re)) return(NULL)
+  ap <- tail(re$periods, 1)
+  get_cal <- function(cur, sub, col) {
+    x <- re$calibration[period == ap & type == "episode" & subset == sub & curves == cur]
+    if (nrow(x)) x[[col]][1] else NA_real_
+  }
+  get_w <- function(cur, col) {
+    x <- re$warnings[period == ap & curves == cur]
+    if (nrow(x)) x[[col]][1] else NA_real_
+  }
+  val <- function(id, cur) switch(id,
+    ratio = get_cal(cur, "All windows", "ratio"),
+    ratio_lg = get_cal(cur, "Large episodes", "ratio"),
+    slope = get_cal(cur, "All windows", "slope"),
+    coverage = get_cal(cur, "All windows", "coverage_95"),
+    pod = get_w(cur, "pod"), far = get_w(cur, "far"), hss = get_w(cur, "hss"),
+    NA_real_)
+  pub <- re$curve_sets[1]
+  lags <- vapply(Filter(Negate(is.null), timing), function(x) as.numeric(x$peak_lag), 0)
+  crit <- data.table::rbindlist(lapply(cfg$readiness, function(r) {
+    if (r$id == "timing") {
+      ok <- length(lags) > 0 && all(lags >= r$lo & lags <= r$hi)
+      return(data.table::data.table(
+        id = r$id, criterion = r$label, range = sprintf("%g to %g", r$lo, r$hi),
+        core = r$core, system = paste(sprintf("%+d", lags), collapse = " / "),
+        published = "(same data)", pass = ok))
+    }
+    v <- val(r$id, label); p <- val(r$id, pub)
+    data.table::data.table(
+      id = r$id, criterion = r$label, range = sprintf("%.2f to %.2f", r$lo, r$hi),
+      core = r$core, system = sprintf("%.2f", v), published = sprintf("%.2f", p),
+      pass = !is.na(v) && v >= r$lo && v <= r$hi)
+  }))
+  verdict <- if (all(crit$pass)) "Ready" else if (all(crit[core == TRUE, pass]))
+    "Ready with caveats" else "Not ready"
+  list(criteria = crit, verdict = verdict, period = ap)
+}

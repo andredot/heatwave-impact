@@ -1,7 +1,10 @@
 # =============================================================================
-# Validation of the Masselot et al. (2023) temperature-mortality curves for
-# Italian cities with Istat daily deaths, and of Open-Meteo temperature
-# forecasts as their input.
+# Heat and mortality in Italian cities, from the Masselot et al. (2023) curves.
+# Two reports:
+#   reports/adaptation_report.qmd   adaptation to heat across Italy since 2011
+#   reports/system_validation.qmd   validation of the impact-based system
+#                                   (rolling curves, recorded temperatures)
+# and the data bundle of the Shiny app.
 #
 #   targets::tar_make()        # run (resumable: downloads are cached)
 #   targets::tar_visnetwork()  # dependency graph
@@ -30,12 +33,9 @@ list(
   tar_target(zenodo_files, download_zenodo(config$zenodo_dir, config$use_coef_simu),
              format = "file"),
   tar_target(erf, read_erf_bundle(zenodo_files, config$country)),
-  tar_target(stage1, read_stage1(zenodo_files, erf$metadata)),
   tar_target(published, read_published_results(zenodo_files, erf$metadata$URAU_CODE)),
   tar_target(era5_masselot, read_era5_masselot(zenodo_files, erf$metadata$URAU_CODE)),
-
-  # ---- do we reconstruct the published curves correctly? --------------------
-  tar_target(metamodel, inspect_metamodel(zenodo_files)),
+  # do we reconstruct the published curves correctly?
   tar_target(recon_check, check_reconstruction(erf, era5_masselot, published, config)),
 
   # ---- city definition ------------------------------------------------------
@@ -46,7 +46,6 @@ list(
   tar_target(istat_cities_file, locate_istat_cities(config), format = "file"),
   tar_target(istat_cities, read_istat_cities(istat_cities_file)),
   tar_target(istat_map, istat_city_map(istat_cities, erf$metadata, lau_pop)),
-  tar_target(istat_coverage, istat_city_coverage(istat_cities, erf$metadata)),
   # Eurostat CITY-LAU table, used when config$city_source is "official"
   tar_target(city_table, read_city_lau_table(config)),
   tar_target(city_map, switch(
@@ -68,7 +67,8 @@ list(
   tar_target(cities, erf$metadata[URAU_CODE %in% crosswalk$map$URAU_CODE,
                                   .(URAU_CODE, name, lat = as.numeric(lat),
                                     lon = as.numeric(lon), pop = as.numeric(pop), inmcc)]),
-  tar_target(baseline_audit, audit_baseline(mort, erf, periods$test$start, periods$test$end)),
+  tar_target(region_codes, region_city_codes(istat_cities, crosswalk$map,
+                                             config$region_focus)),
 
   # ---- exposure -------------------------------------------------------------
   tar_target(era5_points, if (config$era5_mode == "polygon")
@@ -80,97 +80,72 @@ list(
                                        min(data_end, Sys.Date() - 7), config)),
   tar_target(exposure_check, compare_exposure(era5_overlap, era5_masselot)),
   tar_target(exposure_test, build_exposure(era5_test, exposure_check, config)),
+  # Masselot's own temperatures to 2019, our aligned series from 2020
+  tar_target(expo_all, rolling_exposure(era5_masselot, exposure_test)),
 
-  # ---- 1. temperature forecast skill ----------------------------------------
-  tar_target(forecasts, fetch_forecasts_all(cities, min(data_end, Sys.Date() - 7), config)),
-  tar_target(fc_skill, forecast_skill(forecasts, era5_test, erf, config)),
-
-  # ---- 2A. curve comparison (Masselot first stage refitted) -----------------
-  tar_target(curves_test, run_curve_tests(mort, exposure_test, erf,
-                                          periods$test$start, periods$test$end, config)),
-  tar_target(pooled_test, pool_curve_differences(curves_test)),
-  tar_target(blup_test, blup_curves(curves_test, erf, config)),
-  # 2011-2019 uses Masselot's own exposure series (exact same temperatures)
-  tar_target(curves_repro, if (config$run_reproduction)
-    run_curve_tests(mort, era5_masselot, erf, periods$repro$start, periods$repro$end, config)),
-  tar_target(pooled_repro, if (config$run_reproduction) pool_curve_differences(curves_repro)),
-  tar_target(blup_repro, if (config$run_reproduction) blup_curves(curves_repro, erf, config)),
-
-  # ---- 2B. one region in full (every city, small ones shrunk by the BLUPs) --
-  tar_target(region_codes, region_city_codes(istat_cities, crosswalk$map,
-                                             config$region_focus)),
-  tar_target(curves_region, if (length(region_codes))
-    run_curve_tests(mort, exposure_test, erf, periods$test$start, periods$test$end,
-                    config, only = region_codes, age_series = FALSE, min_fit_deaths = 0)),
-  # the pooling uses every Italian fit, so a small city borrows strength
-  tar_target(blup_region, if (length(region_codes))
-    blup_curves(curves_test, erf, config, extra_fits = curves_region$fits,
-                keep = region_codes)),
-  tar_target(region_table, if (length(region_codes))
-    region_curve_table(blup_region, curves_region, erf$metadata)),
-
-  tar_target(curves_periods, run_period_tests(mort, era5_masselot, exposure_test, erf,
-                                              data_end, config)),
-
-  # ---- 2B. heat deaths vs a counterfactual "no heat" baseline ---------------
+  # ---- deaths expected without heat (counterfactual baseline) ---------------
+  # fitted separately before and after COVID-19, every city
   tar_target(episodes, detect_episodes(exposure_test, erf, periods$test$start,
                                        periods$test$end, config)),
   tar_target(counterfactual, fit_counterfactual(mort, exposure_test, episodes, erf,
                                                 periods$test$start, periods$test$end, config)),
   tar_target(cf_eval, evaluate_counterfactual(counterfactual, config)),
-  tar_target(recal_curves, lapply(config$recal_windows, function(w)
-    recalibrate_curves(mort, era5_masselot, erf, w, config))),
-  tar_target(curve_sets, compare_curve_sets(counterfactual, cf_eval, recal_curves, erf, config)),
-  tar_target(example, example_series(counterfactual, recal_curves, erf, cities, config)),
-  tar_target(fc_impact, forecast_episode_impact(counterfactual, cf_eval, forecasts,
-                                                era5_test, exposure_check, erf, config)),
+  tar_target(episodes_hist, detect_episodes(era5_masselot, erf, config$repro_start,
+                                            config$repro_end, config)),
+  tar_target(counterfactual_hist, fit_counterfactual(
+    mort, era5_masselot, episodes_hist, erf, config$repro_start, config$repro_end, config)),
+  tar_target(cf_eval_hist, evaluate_counterfactual(counterfactual_hist, config)),
 
-  # ---- 2C. rolling recalibration: one curve per forecast month --------------
-  # cities that get curves, scores and the app export (the region by default)
-  tar_target(roll_codes, if (identical(config$rolling$scope, "all")) cities$URAU_CODE
-                         else region_codes),
+  # ==== REPORT 1: adaptation across Italy ====================================
+  # every city refitted in consecutive 3-year windows, BLUPs, standardised AF
+  tar_target(adaptation, run_adaptation(mort, era5_masselot, exposure_test, erf,
+                                        data_end, config)),
+  # curve-free check: summer excess deaths against the summer's heat dose
+  tar_target(dose_response, summer_dose_response(list(counterfactual_hist, counterfactual),
+                                                 erf, config)),
+  tar_target(timing_italy, list(
+    `2011-2019` = lag_check(counterfactual_hist, episodes_hist),
+    `2023 onwards` = lag_check(counterfactual, episodes))),
+
+  # ==== REPORT 2: the impact-based system (rolling curves) ==================
+  # curves for every city (the app needs them); scores for the focus region
+  tar_target(roll_codes, if (identical(config$rolling$scope, "region")) region_codes
+                         else cities$URAU_CODE),
+  tar_target(eval_codes, if (length(region_codes)) region_codes else cities$URAU_CODE),
   # cities entering each window's meta-analysis
   tar_target(roll_pool, if (identical(config$rolling$pool, "region")) roll_codes
                         else cities$URAU_CODE),
-  # Masselot's own temperatures to 2019, our aligned series from 2020
-  tar_target(roll_expo, rolling_exposure(era5_masselot, exposure_test)),
   tar_target(roll_plan, rolling_windows(min(mort$date), data_end, config)),
   tar_target(roll_windows, roll_plan$windows, iteration = "list"),
   # one branch per training window: cached, so a new Istat release only fits
   # the windows it changes
-  tar_target(roll_fits, fit_rolling_window(roll_windows, mort, roll_expo, erf, config,
+  tar_target(roll_fits, fit_rolling_window(roll_windows, mort, expo_all, erf, config,
                                            roll_pool, roll_codes),
              pattern = map(roll_windows), iteration = "list"),
-  # two curve sets from the same fits: "window" and "shift" (see rolling_collect)
   tar_target(rolling_sets, rolling_collect(roll_plan, roll_fits, config, erf)),
-  # the one the app and the report's maps use
+  # the set the system uses (rolling$method)
   tar_target(rolling, if (!is.null(rolling_sets[[config$rolling$method]]))
     rolling_sets[[config$rolling$method]] else rolling_sets$window),
-  # pre-COVID years scored too: same baseline model, Masselot's temperatures
-  tar_target(episodes_hist, detect_episodes(era5_masselot[URAU_CODE %in% roll_codes], erf,
-                                            config$repro_start, config$repro_end, config)),
-  tar_target(counterfactual_hist, fit_counterfactual(
-    mort[URAU_CODE %in% roll_codes], era5_masselot[URAU_CODE %in% roll_codes],
-    episodes_hist, erf, config$repro_start, config$repro_end, config)),
-  tar_target(cf_eval_hist, evaluate_counterfactual(counterfactual_hist, config)),
-  # do deaths follow temperature in the data? (a date error would show here)
-  tar_target(timing_check, list(
-    `2023 onwards` = lag_check(counterfactual, episodes),
-    `2011-2019` = lag_check(counterfactual_hist, episodes_hist))),
   tar_target(roll_eval, rolling_evaluation(
     list(list(label = sprintf("%s-%s", format(config$repro_start, "%Y"),
                               format(config$repro_end, "%Y")),
-              cf = counterfactual_hist, ev = cf_eval_hist, recals = FALSE),
+              cf = counterfactual_hist, ev = cf_eval_hist),
          list(label = sprintf("%s-%s", format(periods$test$start, "%Y"),
                               format(periods$test$end, "%Y")),
-              cf = counterfactual, ev = cf_eval, recals = TRUE)),
-    rolling_sets, recal_curves, erf, config, roll_codes)),
+              cf = counterfactual, ev = cf_eval)),
+    rolling, list(), erf, config, eval_codes)),
   tar_target(roll_example, rolling_example(
     list(list(label = "pre-COVID", cf = counterfactual_hist),
          list(label = "post-COVID", cf = counterfactual)),
-    rolling, erf, cities, config, roll_codes)),
+    rolling, erf, cities, config, eval_codes)),
+  tar_target(timing_region, list(
+    `2011-2019` = lag_check(list(daily = counterfactual_hist$daily[URAU_CODE %in% eval_codes]),
+                            episodes_hist[URAU_CODE %in% eval_codes]),
+    `2023 onwards` = lag_check(list(daily = counterfactual$daily[URAU_CODE %in% eval_codes]),
+                               episodes[URAU_CODE %in% eval_codes]))),
+  tar_target(readiness, readiness_check(roll_eval, timing_region, rolling$label, config)),
 
-  # ---- regional excess mortality (official FluMOMO code) --------------------
+  # ---- regional excess mortality (official FluMOMO code, app EuroMOMO tab) --
   tar_target(influenza_file, build_influenza_activity(config), format = "file"),
   tar_target(flumomo_code, download_flumomo(config), format = "file"),
   tar_target(flumomo_weather, build_flumomo_weather(
@@ -178,29 +153,26 @@ list(
     min(data_end, Sys.Date() - 7)), format = "file"),
   tar_target(flumomo_results, run_region_flumomo(config, istat_file, flumomo_weather,
                                                  influenza_file)),
-  tar_target(flumomo_chart, plot_region_excess(flumomo_results, istat_file, config),
-             format = "file"),
-  # same code, restricted to the comuni of the validated cities of the region,
-  # so its baseline can replace ours in test B
   tar_target(region_cities, crosswalk$map[substr(PRO_COM, 1, 3) %in%
                                             config$flumomo$provinces$prov]),
   tar_target(flumomo_cities, run_region_flumomo(config, istat_file, flumomo_weather,
                                                 influenza_file,
                                                 procom = unique(region_cities$PRO_COM),
                                                 label = "cities", code = flumomo_code)),
-  tar_target(flumomo_sensitivity, flumomo_test_b(
-    flumomo_cities, counterfactual, recal_curves, erf, istat_file,
-    unique(region_cities$PRO_COM), unique(region_cities$URAU_CODE), config)),
 
   # ---- data bundle for the Shiny app ----------------------------------------
-  tar_target(app_data, export_app_bundle(counterfactual, recal_curves, erf, cities,
+  # forecasts only feed the app's time machine and scenarios
+  tar_target(forecasts, fetch_forecasts_all(cities, min(data_end, Sys.Date() - 7), config)),
+  tar_target(app_data, export_app_bundle(counterfactual, list(), erf, cities,
                                          crosswalk, gisco_files, exposure_check,
                                          forecasts, era5_test, data_end, config,
                                          "app/app_data.rds",
                                          flumomo_results, flumomo_cities, istat_file,
-                                         mort, istat_cities, rolling),
+                                         mort, istat_cities, rolling,
+                                         cf_hist = counterfactual_hist),
              format = "file"),
 
-  # ---- report ---------------------------------------------------------------
-  tar_quarto(report, "reports//validation_report.qmd")
+  # ---- reports --------------------------------------------------------------
+  tar_quarto(report_adaptation, "reports//adaptation_report.qmd"),
+  tar_quarto(report_validation, "reports//system_validation.qmd")
 )

@@ -87,45 +87,67 @@ cfg <- list(
   tail_days   = 7,      # days after the episode counted in the episode window
   post_days   = 14,     # further days used to look at mortality displacement
 
-  # ---- successive time windows (test of a trend in vulnerability) ----------
-  period_windows = list(c("2011-01-01", "2015-12-31"), c("2016-01-01", "2019-12-31"),
-                        c("2023-01-01", NA)),   # NA = last day with data
+  # ---- Report 1: adaptation across Italy -----------------------------------
+  # Every city refitted in consecutive, non-overlapping windows (see R/adaptation.R).
+  adaptation = list(
+    windows = list(c("2011-01-01", "2013-12-31"), c("2014-01-01", "2016-12-31"),
+                   c("2017-01-01", "2019-12-31"),
+                   c("2023-01-01", NA)),    # NA = last day with data (2026 is folded in:
+                                            # half a year has no summer of its own)
+    summer_months = 6:9,       # reference summers of the standardised attributable fraction
+    exclude_years = 2020:2022, # COVID-19: no reference summer, no window
+    dose_pct      = 90         # heat dose = degrees above this city percentile, summed
+  ),
+  example_city  = "Milan",     # city of the daily example figures
 
-  # ---- recalibrated Italian curves -----------------------------------------
-  recal_windows = list(c("2011-01-01", "2019-12-31"), c("2016-01-01", "2019-12-31")),
-  example_city  = "Milan",
-  example_years = 2024:2026,
-
-  # ---- rolling recalibration: a curve for every forecast month --------------
-  # The published curves are kept as the reference; each target month gets a
-  # curve refitted (Masselot's first stage + BLUPs) on the deaths available
-  # before it. See R/rolling.R.
+  # ---- Report 2 and the app: rolling recalibration --------------------------
+  # Each target month gets a curve refitted (Masselot's first stage + BLUPs) on
+  # the deaths available before it. See R/rolling.R.
   rolling = list(
-    train_years   = 3,            # years of deaths behind each recent curve
-    anchor_years  = 10,           # years behind each city's long-run shape ("shift")
+    train_years   = 3,            # years of deaths behind each curve
+    anchor_years  = 0,            # > train_years adds the "shift" variant (city shape on
+                                  # anchor_years + common recent shift); 0 = not fitted
     skip_years    = 2020:2022,    # COVID-19: never used to train a curve
     skip_targets  = TRUE,         # ... and not predicted either
     update        = "monthly",    # "monthly": refitted every target month on the deaths
                                   # up to the month before; "yearly": once a year, on the
                                   # deaths up to 31 December of the previous year
-    target_months = 5:9,
+    target_months = 4:9,          # April-September: the summers the app shows
     first_target_year = NULL,     # NULL = as early as the Istat history allows (a target
                                   # without train_years of data before it is skipped)
     pool       = "italy",         # cities in the meta-analysis: "italy" (every city with
                                   # min_deaths in the window, plus the scope) or "region"
     min_deaths = 5000,            # Masselot's threshold, for the pooled cities only
-    scope      = "region",        # cities given curves, scored and exported to the app:
-                                  # "region" (region_focus) or "all"
+    scope      = "all",           # cities given curves (the app needs every city):
+                                  # "all" or "region"; the validation scores region_focus
     large_quantile = 2 / 3,       # episodes above this quantile of the published
                                   # prediction are "large"
-    # which set the app and the report's maps use:
-    #   "shift"  each city's curve on the last anchor_years (stable shape) plus the
-    #            change common to all cities over the last train_years (adaptation)
-    #   "window" each city's curve on the last train_years only
-    # Both are always fitted and scored side by side.
-    method = "shift",
+    method = "window",            # "window" or "shift" (needs anchor_years)
     label = "Rolling 3-year Italian curves",
     label_shift = "10-year city curves + 3-year Italian shift"
+  ),
+
+  # ---- Report 2: implementation readiness ----------------------------------
+  # Fixed before looking at the results; the verdict is computed from them.
+  # core = TRUE criteria must all pass for "ready"; the others turn a pass into
+  # "ready with caveats" when they fail.
+  readiness = list(
+    list(id = "ratio",    label = "Observed / predicted heat deaths, all episodes",
+         lo = 0.80, hi = 1.25, core = TRUE),
+    list(id = "ratio_lg", label = "Observed / predicted heat deaths, large episodes",
+         lo = 0.80, hi = 1.25, core = TRUE),
+    list(id = "slope",    label = "Calibration slope, all episodes",
+         lo = 0.80, hi = 1.25, core = FALSE),
+    list(id = "coverage", label = "Episodes inside their 95% prediction interval",
+         lo = 0.85, hi = 1, core = FALSE),
+    list(id = "pod",      label = "Probability of detection of significant excess (POD)",
+         lo = 0.80, hi = 1, core = TRUE),
+    list(id = "far",      label = "False alarm ratio (FAR)",
+         lo = 0, hi = 0.30, core = TRUE),
+    list(id = "hss",      label = "Heidke skill score",
+         lo = 0.40, hi = 1, core = FALSE),
+    list(id = "timing",   label = "Deaths follow temperature by (days, peak of the correlation)",
+         lo = 0, hi = 2, core = TRUE)
   ),
 
   # ---- counterfactual baseline: deaths expected without heat --------------

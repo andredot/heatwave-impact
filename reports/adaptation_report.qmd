@@ -1,0 +1,595 @@
+---
+title: "Adaptation to heat in Italian cities, 2011-2026"
+subtitle: "Refitting the Masselot et al. (2023) exposure-response functions on successive windows of Istat mortality"
+date: today
+bibliography: references.bib
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    embed-resources: true
+    fig-width: 9
+    fig-height: 5
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(targets)
+library(data.table)
+library(ggplot2)
+theme_set(theme_minimal(base_size = 12))
+cfg      <- tar_read(config)
+data_end <- tar_read(data_end)
+xw       <- tar_read(crosswalk)
+ck       <- xw$checks
+ad       <- tar_read(adaptation)
+dr       <- tar_read(dose_response)
+tm       <- Filter(Negate(is.null), tar_read(timing_italy))
+cities   <- tar_read(cities)
+rc       <- tar_read(recon_check)
+exc      <- tar_read(exposure_check)$summary
+fmt <- function(x, d = 2) formatC(x, format = "f", digits = d, big.mark = ",")
+pct <- function(x, d = 0) paste0(fmt(100 * x, d), "%")
+kbl <- function(x, ...) knitr::kable(x, ...)
+ci  <- function(e, lo, hi, d = 3) sprintf("%s (95%% CI %s-%s)", fmt(e, d), fmt(lo, d), fmt(hi, d))
+ac  <- cfg$adaptation
+win_lab <- ad$pooled$window
+first_w <- ad$pooled[1]; last_w <- ad$pooled[.N]
+tr_all  <- ad$trend[1]
+tr_bal  <- if (nrow(ad$trend) > 1) ad$trend[2] else NULL
+af_pub  <- ad$af[1]; af_w <- ad$af[-1]
+mmt_w   <- ad$mmt[, .(mmp = median(mmp), mmt = median(mmt)), by = .(window, midyear)]
+n_an    <- ck[analysed == TRUE, .N]
+dth_win <- ad$cities[, .(deaths = sum(deaths), fitted = sum(status == "fitted"),
+                         cities = .N), by = window]
+yr0 <- format(min(as.Date(sapply(ac$windows, `[`, 1))), "%Y")
+```
+
+**Abstract.**
+*Background.* The exposure-response functions published by Masselot et al.
+[-@masselot2023] give the heat-related mortality risk of 854 European cities;
+for Italy they rest on deaths of 2001-2010. Whether Italian populations have
+since become less vulnerable to heat matters both for health impact estimates
+and for warning systems built on these curves.
+*Methods.* We refitted the first stage of the published model, unchanged, on
+Istat daily deaths aged 20+ of `r n_an` Italian cities in
+`r nrow(ad$pooled)` consecutive windows from `r yr0` to `r format(data_end, "%Y")`
+(`r paste(win_lab, collapse = ", ")`; 2020-2022 excluded), pooled the city
+curves in a multivariate random-effects meta-analysis, and compared each
+window with the published curves on three measures: the relative risk at the
+99th temperature percentile, the minimum mortality temperature, and the
+heat-attributable fraction standardised to the same summers and deaths. A
+curve-free measure, excess deaths per unit of summer heat, complements them.
+*Results.* Relative to the published curves, the heat relative risk at the
+99th percentile was `r ci(first_w$ratio, first_w$lo, first_w$hi)` times the
+published one in `r first_w$window` and `r ci(last_w$ratio, last_w$lo, last_w$hi)`
+in `r last_w$window`, a change of `r if (!is.null(tr_all) && nrow(ad$trend)) ci(tr_all$change_per_decade, tr_all$lo, tr_all$hi) else "n/a"`
+per decade. The standardised heat-attributable fraction of summer deaths was
+`r pct(af_pub$af, 2)` with the published curves, `r pct(af_w$af[1], 2)` in
+`r af_w$window[1]` and `r pct(af_w$af[nrow(af_w)], 2)` in `r af_w$window[nrow(af_w)]`.
+*Conclusions.* `r if (last_w$ratio < 1 && ad$af_trend$hi < 1) "Heat vulnerability in Italian cities is lower than the published curves imply and has kept falling over the last fifteen years; impact estimates and warning systems should use curves refitted on recent mortality." else "The evidence for a change in heat vulnerability is mixed; see the discussion."`
+
+# Introduction
+
+High temperatures raise mortality, mostly among the elderly and people with
+chronic disease, and the effect is concentrated in the first days of a hot
+spell. The 2003 heatwave caused thousands of excess deaths in Italian cities
+[@michelozzi2005], and the summer of 2022 tens of thousands across Europe
+[@ballester2023]. Quantifying this risk relies on exposure-response functions
+estimated with distributed lag non-linear models (DLNM) [@gasparrini2010]:
+for each city, the relative risk of death as a function of daily temperature,
+cumulated over the following weeks.
+
+Masselot et al. [@masselot2023] published such functions for 854 European
+cities, by age group, in a form that can be reused: city-specific spline
+coefficients, their covariance, and the temperature distribution that defines
+the spline knots. They were obtained in two stages, a time-series model in
+each of the cities of the Multi-Country Multi-City (MCC) network with
+mortality data, then a meta-regression on city characteristics that predicts
+a curve for every city. For Italy the mortality behind them covers 2001-2010.
+
+Heat-related risk is not fixed. Air conditioning, building changes,
+heat-health warning systems and prevention plans introduced after 2003,
+changes in the health of the elderly population, and acclimatisation can all
+lower it, and several studies have found declining heat effects over recent
+decades in Europe and elsewhere [@gasparrini2015; @dedonato2015; @achebak2019].
+A curve fitted on 2001-2010 may therefore overstate today's risk.
+
+This report asks whether, and by how much, heat vulnerability in Italian
+cities changed between `r yr0` and `r format(data_end, "%Y")`. The design keeps
+everything of the published model fixed - city definitions, temperature
+series, model specification, spline knots - and changes only the years of
+mortality the model sees, so any difference between windows can be read as a
+change in the population's response to heat.
+
+# Methods
+
+## Overview
+
+1. Each Urban Audit city of the published curves is mapped to the Istat
+   comuni that compose it, and its Istat daily deaths are checked against the
+   population and death rates the curves were built for.
+2. Daily mean temperatures are the ERA5-Land series of the published study up
+   to 2019 and an aligned reconstruction of the same series afterwards.
+3. The published curves are rebuilt from their coefficients and checked
+   against the published results.
+4. The first-stage model of the published study is refitted in every city in
+   each of `r nrow(ad$pooled)` consecutive, non-overlapping windows; the city
+   fits of a window are pooled and shrunk in a multivariate meta-analysis.
+5. Heat vulnerability is measured in each window by (a) the relative risk at
+   the 99th percentile against the published curve, (b) the minimum mortality
+   temperature, (c) the heat-attributable fraction standardised to common
+   summers and deaths, and (d) without any curve, the excess deaths of each
+   summer per unit of heat.
+
+The whole analysis is a reproducible pipeline (R, `targets`); every choice
+below is a named parameter of its configuration, reported in the appendix.
+
+## Mortality data
+
+**Source.** Istat, *Decessi giornalieri per comune* (daily deaths by comune of
+residence), release `r basename(cfg$istat_url)`, file
+`r basename(cfg$istat_csv)`. The file has one row per comune, sex-aggregated
+age class (`CL_ETA`: 0 = 0 years, 1 = 1-4, then 5-year classes to 21 = 100+)
+and day of the year (`GE`, month and day as MMDD), and one column of deaths
+per year (`T_11` ... `T_26`). Values not yet available are coded `n.d.`; days
+with no deaths are absent.
+
+**Processing.** (i) Comune codes are padded to six digits. (ii) `GE` is read
+as month-day and combined with the year of the column; 29 February rows of
+non-leap years are dropped. (iii) Age classes are merged into the published
+age groups (20-44 = classes 5-9, 45-64 = 10-13, 65-74 = 14-15, 75-84 = 16-17,
+85+ = 18-21); deaths below 20 years are excluded, as in the published study.
+(iv) Deaths are summed over the comuni of each city; days absent from the file
+are filled with zero deaths. (v) The last day with data is the last date with
+a non-missing value: **`r format(data_end, "%d %B %Y")`**. The data start on
+1 January 2011.
+
+**Timing check.** A date error anywhere between the Istat file and the
+temperature series would shift deaths against the temperatures that cause
+them. Within each city and summer (May-September), daily excess deaths
+(observed minus the baseline of section 2.9) and temperature are centred on
+their summer means and their correlation is computed with temperature shifted
+by -10 to +10 days, pooled over cities and summers. Correct dates give a peak
+at 0 to +2 days (deaths on the day of the heat and the following ones).
+
+## City definition and validation of deaths
+
+**Unit.** The published curves are indexed by Urban Audit city codes
+(Eurostat), in which the *greater city* replaces the core municipality where
+the urban area extends well beyond it (e.g. Milan, 96 comuni). Each code is
+mapped to its comuni with the official Istat composition of the Cities 2021
+(SITUAS report *Composizione delle Città (Cities) 2021*, under EU Regulation
+2019/1130), which lists the Urban Audit code and the six-digit Istat code of
+every comune: no name matching or geographic inference is involved. A
+geometric matching (the city point of the published metadata located in the
+GISCO `r cfg$urau_year` Urban Audit polygons; comuni with at least
+`r pct(cfg$lau_share_min)` of their area inside) is computed as an
+independent check, and the share of comuni the two compositions have in common
+is reported. Where both the core comune and the greater city are candidates,
+the level whose population is closer to the published one (on the log scale)
+is retained.
+
+**Checks.** For every city:
+
+- *codes:* all its comuni must exist in the Istat file (comuni lost to mergers
+  are dropped if they hold at most `r pct(cfg$missing_pop_tol)` of the city's
+  population);
+- *population:* population of the retained comuni (GISCO LAU `r cfg$lau_year`)
+  divided by the population in the published metadata, accepted between
+  `r cfg$pop_ratio_ok[1]` and `r cfg$pop_ratio_ok[2]`;
+- *deaths:* mean annual Istat deaths aged 20+ in 2011-2019 divided by the
+  deaths implied by the published metadata (population x age structure x
+  age-specific death rates of each 5-year band), accepted between
+  `r cfg$deaths_ratio_ok[1]` and `r cfg$deaths_ratio_ok[2]`. This tests that
+  the deaths analysed belong to the population the curve describes.
+
+A city failing both the population and the deaths check, or with codes
+missing, is excluded. A city whose population matches but whose deaths ratio
+falls outside the band is kept and flagged: the metadata death rates are
+regional averages, so the mismatch reflects the rates, not the city.
+
+## Temperature
+
+**Variable.** Daily mean 2 m air temperature from ERA5-Land
+[@munozsabater2021], the reanalysis used by the published study, averaged over
+the 0.1° grid cells whose centres fall inside the city.
+
+**Series.** Up to 31 December 2019 the published study's own series
+(`era5series.csv` of its data repository) is used, so the exposure of the
+pre-COVID windows is exactly the one the published curves were fitted on.
+From 2020, ERA5-Land is downloaded from the Open-Meteo archive for up to
+`r cfg$era5_max_points` cell centres inside the city's GISCO polygon (the
+city point if no centre falls inside), averaged, with days defined in
+`r cfg$era5_timezone`. Over `r format(cfg$overlap_start, "%Y")`-`r format(cfg$overlap_end, "%Y")`
+both series exist; the city x calendar-month mean difference between them is
+`r if (isTRUE(cfg$bias_correct)) "subtracted from the downloaded series" else "reported but not corrected"`,
+so the two are on the same scale as the distribution the spline knots come
+from.
+
+## Published curves
+
+For each city and age group the published study provides five coefficients
+of a quadratic B-spline of temperature (internal knots at the 10th, 75th and
+90th percentiles, boundary knots at the minimum and maximum of the city's
+1990-2019 daily mean temperatures), their 5 x 5 covariance matrix and 1000
+simulated coefficient vectors. The curve is the log relative risk cumulated
+over lags 0-21. The minimum mortality temperature (MMT) is the temperature of
+lowest risk on the grid of the city's temperature percentiles between the
+`r cfg$mmp_range[1]`th and `r cfg$mmp_range[2]`th; relative risks are centred on it.
+For deaths 20+ as a whole, the five age-specific curves are combined as the
+death-weighted mean of their relative risks, each centred on its own MMT.
+
+**Reconstruction check.** The curves rebuilt here are applied to the
+published study's own temperature series and annual deaths of 1990-2019,
+and the MMTs and annual heat-attributable deaths are compared with those the
+study published.
+
+## Refitting the curves
+
+**Model.** In each city and window, daily deaths aged 20+ are modelled with a
+quasi-Poisson regression, exactly as in the published first stage:
+
+- a cross-basis of temperature (quadratic B-spline with the *published* knots,
+  so coefficients are directly comparable with the published ones) and lag
+  (natural cubic spline over lags 0-`r cfg$lag_max` with `r cfg$lag_nknots`
+  internal knots equally spaced on the log scale) [@gasparrini2010];
+- indicators of the day of the week;
+- a natural cubic spline of time with `r cfg$df_time_per_year` degrees of
+  freedom per year, for seasonality and long-term trends.
+
+The fitted cross-basis is reduced to the overall cumulative exposure-response
+curve, five coefficients in the published basis with their covariance. Every
+city is fitted in every window, whatever its number of deaths (the published
+study required `r format(cfg$min_deaths, big.mark = ",")` deaths per series); small
+cities are handled by the second stage. A model that does not converge is
+recorded and the city takes the pooled curve.
+
+**Windows.** `r paste(win_lab, collapse = ", ")`. Windows ending by 2019 use
+the published study's temperature series, later ones the aligned
+reconstruction. 2020-2022 are excluded: COVID-19 caused excess deaths of a
+size and timing (including the spring and autumn waves) that a seasonal
+spline cannot separate from temperature effects. The last window runs to the
+last day of data; the first half of 2026 is folded into it because half a
+year contains no summer of its own. The first stage needs each day's
+temperatures of the previous `r cfg$lag_max` days, which are taken from the
+same series.
+
+**Second stage.** The five coefficients of all city fits of a window are
+pooled in a multivariate random-effects meta-analysis estimated by restricted
+maximum likelihood [@gasparrini2012; @sera2019], with the method of moments
+and then a fixed-effect model as fall-backs if REML does not converge. Each
+city is represented by its best linear unbiased prediction (BLUP): a
+precision-weighted compromise between its own fit and the pooled curve, so a
+small city borrows strength from the others in proportion to the noise of its
+own data.
+
+## Measures of heat vulnerability
+
+**(a) Relative risk at the 99th percentile.** For each city and window, the
+log relative risk at the city's 99th percentile against the *published* MMT
+(a common reference, so that the comparison is not affected by a shift of the
+minimum) is computed for the refitted curve and for the published curve, and
+their difference d is taken; its standard error comes from 1000 independent
+draws of each curve's coefficients. The city differences of a window are
+pooled by univariate random-effects meta-analysis (REML), giving the ratio of
+heat relative risks refitted / published, exp(d). A meta-regression of d on
+the window midpoint, with a random intercept per city, gives the change per
+decade. As a sensitivity analysis, the trend is re-estimated on the balanced
+panel of cities with at least `r format(cfg$min_deaths, big.mark = ",")` deaths in every
+window, so that a change in the mix of cities cannot produce it.
+
+**(b) Minimum mortality temperature.** The MMT of each city's BLUP curve, and
+its percentile in the city's 1990-2019 distribution. A rising MMT percentile
+means a population that starts to suffer from heat at higher temperatures.
+
+**(c) Standardised heat-attributable fraction.** Differences in attributable
+deaths between windows mix three things: vulnerability, how hot the summers
+were, and how many people died. To isolate the first, every window's curves
+are applied to the *same reference summers*: each city's daily temperatures
+in `r paste(month.name[range(ac$summer_months)], collapse = "-")` of all the years
+analysed (`r paste(range(ad$reference$years), collapse = "-")`, without
+`r paste(range(ac$exclude_years), collapse = "-")`; `r format(ad$reference$days, big.mark = ",")`
+city-days), with a constant reference number of deaths per day (the city's
+mean daily deaths aged 20+ over the same days). The attributable fraction of
+a city follows the published formula [@gasparrini2014]: on days at or above
+the curve's MMT, 1 - exp(-(f(T) - f(MMT))), averaged over the reference days.
+The national value is the mean over cities weighted by their reference
+deaths; its interval comes from 1000 draws of each city's BLUP coefficients.
+The same calculation with the published curves gives the reference level.
+The change per decade is estimated draw by draw by regressing the log of the
+national fraction on the window midpoint. `r length(ad$reference$cities)` cities
+with a curve in every window enter it.
+
+**(d) Curve-free check: excess deaths per unit of heat.** For every city and
+summer (June-September) with a baseline and complete in the data, the observed excess X = O - B, where
+B is the number of deaths expected without heat (below), is related to the
+summer's *heat dose*, the sum over its days of the degrees above the city's
+`r ac$dose_pct`th percentile of 1990-2019. Within each window, X / B is
+regressed on the dose through the origin, weighted by B: the slope is the
+percentage excess mortality per 10 degree-days. No exposure-response curve
+enters this measure.
+
+The baseline B is a quasi-Poisson model of daily deaths with day of the week,
+a natural spline of time (`r cfg$baseline_trend_df_per_year` df per year) and
+`r cfg$baseline_harmonics` annual sine-cosine pair, fitted only on *reference
+days*: outside `r paste(month.abb[cfg$baseline_exclude_months], collapse = ", ")`
+(influenza season) and not within `r cfg$baseline_hot_lag` days after a day at
+or above the published MMT. `r if (isTRUE(cfg$baseline_cold_offset)) "The published cold effect on reference days enters as an offset, so B is the number of deaths expected at the MMT." else ""`
+It is fitted separately for 2011-2019 and for 2023 onwards, by age group
+(groups with fewer than `r cfg$baseline_min_daily` deaths a day use the 20+
+model times their share).
+
+## Software
+
+R with `dlnm` (cross-basis, reduction), `mixmeta` (meta-analyses and BLUPs),
+`data.table`, `splines`, `sf` and `targets` (pipeline). Random draws use seed
+`r cfg$seed`; `r format(cfg$nsim, big.mark = ",")` draws throughout.
+
+# Results
+
+## Data
+
+```{r data-summary}
+kbl(data.table(
+  Item = c("Cities in the published metadata (Italy)", "Cities analysed",
+           "... passing every check", "... kept with a deaths-ratio flag",
+           "... kept with a population flag", "Excluded",
+           "Comuni in the analysed cities", "Deaths aged 20+ analysed",
+           "Last day of data"),
+  Value = c(nrow(ck), n_an, ck[status == "ok", .N],
+            ck[status == "deaths differ from metadata rates", .N],
+            ck[status == "check population", .N], ck[analysed == FALSE, .N],
+            format(uniqueN(xw$map$PRO_COM), big.mark = ","),
+            format(sum(dth_win$deaths), big.mark = ","), format(data_end, "%d %B %Y"))),
+  caption = "Cities and deaths")
+```
+
+```{r windows-table}
+kbl(merge(dth_win, ad$pooled[, .(window, n_fitted)], by = "window")[
+  , .(Window = window, `Cities` = cities, `Fitted (converged)` = fitted,
+      `Deaths 20+` = format(deaths, big.mark = ","),
+      Temperatures = fifelse(as.integer(substr(window, 6, 9)) <= 2019,
+                             "published study's series", "aligned reconstruction"))],
+  caption = "Windows of the analysis")
+```
+
+```{r checks-plot, fig.height=4.5}
+#| fig-cap: "Population and deaths of each city against the published metadata. Green: accepted range."
+ggplot(ck[!is.na(deaths_ratio)], aes(pop_ratio, deaths_ratio, colour = status)) +
+  annotate("rect", xmin = cfg$pop_ratio_ok[1], xmax = cfg$pop_ratio_ok[2],
+           ymin = cfg$deaths_ratio_ok[1], ymax = cfg$deaths_ratio_ok[2],
+           alpha = .08, fill = "darkgreen") +
+  geom_point(aes(size = pop), alpha = .7) +
+  geom_text(data = ck[!is.na(deaths_ratio) & status != "ok"], aes(label = name),
+            size = 3, vjust = -1, show.legend = FALSE) +
+  scale_x_log10() + scale_y_log10() + scale_size_area(guide = "none") +
+  labs(x = "Population of the comuni / published population",
+       y = "Istat deaths 20+ / deaths implied by metadata", colour = NULL)
+```
+
+The official composition and the geometric matching give identical comuni for
+`r ck[!is.na(agreement) & agreement == 1, .N]` of
+`r ck[!is.na(agreement), .N]` cities. The reconstruction of the published
+curves reproduces the published minimum mortality temperatures (median
+difference `r fmt(median(rc$mmt_diff))` °C over `r nrow(rc)` city-age groups) and
+annual heat-attributable deaths (median ratio `r fmt(median(rc$heat_ratio), 3)`).
+The downloaded temperature series agrees with the published one with a
+median daily correlation of `r fmt(median(exc$r), 3)` and a median absolute
+difference of `r fmt(median(exc$mae))` °C before correction.
+
+```{r timing, fig.height=3.2}
+#| fig-cap: "Correlation of daily excess deaths with temperature k days earlier, within city and summer. Peak at 0 to +2 days: dates aligned."
+if (length(tm)) {
+  cc <- rbindlist(lapply(names(tm), function(p) cbind(period = p, tm[[p]]$ccf)))
+  pk <- cc[, .SD[which.max(r)], by = period]
+  ggplot(cc, aes(lag, r, colour = period)) + geom_vline(xintercept = 0, colour = "grey60") +
+    geom_line() + geom_point(data = pk, size = 2.5) +
+    labs(x = "Days by which deaths follow temperature", y = "Correlation", colour = NULL) +
+    theme(legend.position = "bottom")
+}
+```
+
+`r if (length(tm)) sprintf("The correlation peaks at %s: deaths follow the temperature, as they should.", paste(sprintf("%+d days (%s)", pk$lag, pk$period), collapse = " and ")) else ""`
+
+## Heat relative risk
+
+```{r pooled-table}
+kbl(ad$pooled[, .(Window = window, Cities = k,
+                  `RR99 refitted / published` = ci(ratio, lo, hi),
+                  p = fmt(p, 3), `I² of the difference` = pct(i2 / 100))],
+    caption = "Heat relative risk at the 99th percentile, refitted against published (1 = unchanged)")
+```
+
+```{r pooled-plot, fig.height=4}
+#| fig-cap: "Pooled ratio of heat relative risks, refitted / published, by window (95% CI). Grey: individual cities with enough deaths for their own estimate."
+cty <- ad$cities[status == "fitted" & below_threshold == FALSE]
+ggplot(ad$pooled, aes(midyear, ratio)) + geom_hline(yintercept = 1, linetype = 2) +
+  geom_line(data = cty, aes(midyear, exp(d_lr99), group = URAU_CODE), colour = "grey85") +
+  geom_pointrange(aes(ymin = lo, ymax = hi), colour = "firebrick") +
+  scale_y_log10() +
+  labs(x = "Window midpoint", y = "RR99 refitted / published")
+```
+
+```{r trend-table}
+if (nrow(ad$trend))
+  kbl(ad$trend[, .(Sample = sample, Cities = cities, Fits = fits,
+                   `Change per decade` = ci(change_per_decade, lo, hi), p = fmt(p, 3))],
+      caption = "Trend of the heat relative risk (meta-regression on the window midpoint, random city intercept)")
+```
+
+Already in `r first_w$window` the heat risk was `r fmt(first_w$ratio, 3)` times the
+published one; by `r last_w$window` it was `r fmt(last_w$ratio, 3)` times.
+`r if (nrow(ad$trend)) sprintf("Across windows the ratio changes by a factor of %s per decade%s.", ci(tr_all$change_per_decade, tr_all$lo, tr_all$hi), if (!is.null(tr_bal)) sprintf(", and by %s in the balanced panel of %d cities", ci(tr_bal$change_per_decade, tr_bal$lo, tr_bal$hi), tr_bal$cities) else "") else ""`
+
+## Minimum mortality temperature
+
+```{r mmt-plot, fig.height=4}
+#| fig-cap: "Percentile of the minimum mortality temperature in each city's 1990-2019 distribution, BLUP curves, by window. Diamond: median."
+ggplot(ad$mmt, aes(factor(window, win_lab), mmp)) +
+  geom_boxplot(outlier.size = .6, colour = "grey40") +
+  geom_point(data = mmt_w, aes(factor(window, win_lab), mmp), shape = 23, size = 3,
+             fill = "firebrick") +
+  labs(x = NULL, y = "MMT percentile")
+```
+
+The median MMT moved from the `r fmt(mmt_w$mmp[1], 0)`th percentile
+(`r fmt(mmt_w$mmt[1], 1)` °C) in `r mmt_w$window[1]` to the
+`r fmt(mmt_w$mmp[nrow(mmt_w)], 0)`th (`r fmt(mmt_w$mmt[nrow(mmt_w)], 1)` °C) in
+`r mmt_w$window[nrow(mmt_w)]`.
+
+## Standardised heat-attributable fraction
+
+```{r af-table}
+kbl(ad$af[, .(Curves = window, `Heat-attributable fraction of summer deaths` =
+                sprintf("%s (%s-%s)", pct(af, 2), pct(lo, 2), pct(hi, 2)))],
+    caption = sprintf("Same summers (%s, %s) and same deaths, different curves",
+                      paste(month.abb[range(ac$summer_months)], collapse = "-"),
+                      paste(range(ad$reference$years), collapse = "-")))
+```
+
+```{r af-plot, fig.height=4}
+ggplot(ad$af, aes(midyear, af)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi,
+                      colour = window == "Published (2001-2010 data)")) +
+  scale_colour_manual(values = c(`TRUE` = "grey40", `FALSE` = "firebrick"), guide = "none") +
+  scale_y_continuous(labels = function(x) paste0(100 * x, "%")) +
+  labs(x = "Midpoint of the mortality data", y = "Heat-attributable fraction")
+```
+
+Applied to the same summers and the same deaths, the published curves
+attribute `r pct(af_pub$af, 2)` of summer deaths to heat; the curves of
+`r af_w$window[1]` attribute `r pct(af_w$af[1], 2)` and those of
+`r af_w$window[nrow(af_w)]` `r pct(af_w$af[nrow(af_w)], 2)`. Over the windows the
+fraction changes by a factor of
+`r ci(ad$af_trend$change_per_decade, ad$af_trend$lo, ad$af_trend$hi)` per decade.
+
+## Excess deaths per unit of heat, without curves
+
+```{r dose-table}
+if (!is.null(dr))
+  kbl(dr$slopes[, .(Window = window, `City-summers` = summers, Cities = cities,
+                    `Mean heat dose (°C-days)` = fmt(dose_mean, 1),
+                    `Summer excess` = paste0(fmt(excess_pct, 1), "%"),
+                    `Excess per 10 °C-days` = sprintf("%s%% (%s to %s)", fmt(slope_pct, 2),
+                                                      fmt(lo, 2), fmt(hi, 2)))],
+      caption = sprintf("Summer excess deaths against heat dose (degrees above P%d)", dr$dose_pct))
+```
+
+```{r dose-plot, fig.height=4.5}
+if (!is.null(dr)) {
+  s <- copy(dr$summers)[B > 0]
+  ggplot(s, aes(dose, 100 * X / B, colour = window)) +
+    geom_hline(yintercept = 0, colour = "grey70") +
+    geom_point(aes(size = B), alpha = .35) +
+    geom_abline(data = dr$slopes, aes(intercept = 0, slope = slope_pct / 10, colour = window),
+                linewidth = 1) +
+    scale_size_area(max_size = 4, guide = "none") +
+    labs(x = sprintf("Heat dose, °C-days above P%d", dr$dose_pct), y = "Summer excess (% of B)",
+         colour = NULL) + theme(legend.position = "bottom")
+}
+```
+
+# Discussion
+
+```{r disc}
+falling <- last_w$ratio < first_w$ratio
+sig <- nrow(ad$trend) && tr_all$hi < 1
+dose_fall <- !is.null(dr) && nrow(dr$slopes) > 1 &&
+  dr$slopes$slope_pct[nrow(dr$slopes)] < dr$slopes$slope_pct[1]
+```
+
+**Main findings.** Refitting the published model on Italian mortality,
+with nothing changed but the years of data, gives a heat risk below the
+published one in every window, and `r if (falling) "lower in the most recent windows than in the earliest" else "not consistently lower in recent windows"`.
+`r if (sig) "The decline is statistically significant and survives restricting the analysis to the same cities in every window, so it is not an artefact of which cities could be fitted." else "The trend is not statistically conclusive at the 5% level."`
+The same picture comes from three angles that share little: the relative risk
+at the 99th percentile, the attributable fraction under fixed summers and
+deaths, and `r if (dose_fall) "the excess deaths per degree-day of heat, which uses no curve at all and also fell" else "the curve-free excess per degree-day, which does not show the same clear decline (see limitations)"`.
+
+**Interpretation.** The published curves rest on 2001-2010 and include the
+2003 heatwave; they describe a population that was more vulnerable to heat
+than today's. Several mechanisms are compatible with the decline: the
+national heat-health warning system and prevention plans introduced after
+2003, wider use of air conditioning, and changes in the frailty of the
+oldest age groups. This analysis cannot separate them. It does show that the
+change is a common shift: heterogeneity between cities in the difference
+with the published curves is small, so the decline is not driven by a few
+cities.
+
+**Consistency with other studies.** Declines in heat-related mortality risk
+over recent decades have been reported in multi-country analyses
+[@gasparrini2015], in European cities including Italian ones
+[@dedonato2015], and nationally in Spain [@achebak2019]. The present
+analysis extends these findings to the most recent years and to the
+specific curves used for health impact assessment in Europe
+[@masselot2023].
+
+**Strengths.** The design changes one thing - the years of mortality - and
+keeps the published specification, knots and (until 2019) temperatures.
+City definitions are official and checked against deaths. The reconstruction
+of the published curves is verified numerically. Every city enters every
+window, with shrinkage rather than exclusion for small ones, and a balanced
+panel guards against changes in composition. The standardised fraction
+removes the effect of hotter summers and of changing death counts.
+
+**Limitations.**
+
+- *COVID-19.* 2020-2022 are excluded; the first post-pandemic window may
+  still carry the mortality deficit that followed the pandemic's excess
+  deaths (frail people who died earlier are not there to die of heat), which
+  would lower its heat risk for reasons other than adaptation.
+- *Window length.* Three years give few deaths in small cities; their curves
+  lean on the pooled one, and their contribution to the trend is small.
+- *Deaths by residence.* Istat counts deaths by comune of residence, as did
+  the published study; deaths of commuters or tourists are not assigned to
+  the city where heat was experienced.
+- *All ages 20+.* The refitted curves are for deaths 20+ as a whole; a change
+  in the age structure of deaths is part of what they measure.
+- *Baseline.* The curve-free measure depends on the baseline of expected
+  deaths, whose level is anchored by the published cold effect; an error in
+  that level moves all summers of a period together.
+- *Temperature.* After 2019 the exposure is a reconstruction of the published
+  series, aligned month by month; agreement before alignment is high but not
+  perfect, notably in cities on steep terrain.
+
+# Conclusions
+
+`r if (last_w$ratio < 1) sprintf("Italian cities are less vulnerable to heat than the published curves imply: in %s the heat relative risk at the 99th percentile was %s times the published one, and the share of summer deaths attributable to heat under the same summers was %s instead of %s.", last_w$window, fmt(last_w$ratio, 2), pct(af_w$af[nrow(af_w)], 1), pct(af_pub$af, 1)) else "The refitted curves do not show lower heat vulnerability than the published ones."`
+Health impact estimates and heat-health warning systems that use the
+published curves without recalibration will overstate the deaths caused by
+heat in Italy, and the gap is likely to keep growing.
+
+# References {.unnumbered}
+
+::: {#refs}
+:::
+
+# Appendix {.appendix}
+
+## Cities flagged or excluded
+
+```{r app-flagged}
+fl <- ck[status != "ok", .(City = name, Status = status, Comuni = n_comuni,
+                           `Pop. ratio` = fmt(pop_ratio), `Deaths ratio` = fmt(deaths_ratio),
+                           Analysed = analysed)]
+if (nrow(fl)) kbl(fl) else cat("All cities passed every check.")
+```
+
+## Configuration
+
+```{r config}
+keep <- c("istat_url", "city_source", "urau_year", "lau_year", "lau_share_min",
+          "missing_pop_tol", "pop_ratio_ok", "deaths_ratio_ok", "era5_mode",
+          "era5_max_points", "era5_timezone", "bias_correct", "overlap_start", "overlap_end",
+          "lag_max", "lag_nknots", "var_pct", "var_degree", "df_time_per_year", "min_deaths",
+          "mmp_range", "rr_pct", "nsim", "baseline_exclude_months", "baseline_hot_lag",
+          "baseline_harmonics", "baseline_trend_df_per_year", "baseline_min_daily",
+          "baseline_cold_offset", "adaptation", "seed")
+kbl(data.table(Parameter = keep,
+               Value = vapply(cfg[keep], function(v) paste(format(v), collapse = ", "), "")))
+```

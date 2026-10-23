@@ -1,0 +1,540 @@
+---
+title: "Validation of the impact-based heat-mortality system"
+subtitle: "Rolling 3-year curves, recorded temperatures, cities of the focus region"
+date: today
+bibliography: references.bib
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    embed-resources: true
+    fig-width: 9
+    fig-height: 5
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(targets)
+library(data.table)
+library(ggplot2)
+theme_set(theme_minimal(base_size = 12))
+cfg      <- tar_read(config)
+data_end <- tar_read(data_end)
+rl       <- tar_read(rolling)
+re       <- tar_read(roll_eval)
+rx       <- tar_read(roll_example)
+rd       <- tar_read(readiness)
+tm       <- Filter(Negate(is.null), tar_read(timing_region))
+codes    <- tar_read(eval_codes)
+nm_city  <- tar_read(cities)[, .(URAU_CODE, name)]
+fmt <- function(x, d = 2) formatC(x, format = "f", digits = d, big.mark = ",")
+pct <- function(x, d = 0) paste0(fmt(100 * x, d), "%")
+kbl <- function(x, ...) knitr::kable(x, ...)
+rc  <- cfg$rolling
+has_roll <- !is.null(rl) && nrow(rl$windows) > 0 && !is.null(re)
+PUB <- if (has_roll) re$curve_sets[1] else "Published (Masselot et al.)"
+SYS <- if (has_roll) rl$label else rc$label
+ap  <- if (has_roll) tail(re$periods, 1) else ""
+city_names <- sort(nm_city[URAU_CODE %in% codes, name])
+n_ep <- if (has_roll) re$windows[curves == SYS & type == "episode", .N] else 0
+```
+
+::: {.callout-note appearance="simple"}
+**Verdict: `r if (!is.null(rd)) rd$verdict else "not available"`.**
+`r if (!is.null(rd)) sprintf("%d of %d pre-specified criteria met (%d of %d core criteria), over %d heatwave episodes in %d cities of %s, %s.", sum(rd$criteria$pass), nrow(rd$criteria), sum(rd$criteria[core == TRUE, pass]), rd$criteria[core == TRUE, .N], n_ep, length(codes), cfg$region_focus, tolower(rd$period)) else ""`
+Temperatures are those recorded (ERA5-Land): this validates the
+heat-to-deaths part of the system; forecast errors are left to a later
+version.
+:::
+
+# Introduction
+
+The impact-based system turns daily temperatures into numbers of deaths: for
+every city and day it gives the deaths expected without heat, the deaths
+expected with the temperatures of that day, the difference (deaths
+attributable to heat), a 95% range for each, and a warning when deaths are
+expected to exceed what is normal for the season. The temperature-mortality
+relation comes from the exposure-response functions of Masselot et al.
+[-@masselot2023], **recalibrated every month on the last `r rc$train_years`
+years of Istat deaths**, because the published curves (2001-2010 data)
+overstate today's heat risk in Italy (companion report on adaptation).
+
+This report asks whether the system is ready to be used: whether, given the
+temperatures that actually occurred, its numbers of deaths match the deaths
+that were observed, whether its uncertainty ranges contain them as often as
+they should, and whether it would have warned of the heatwaves that caused
+an abnormal excess of deaths without raising too many false alarms. The
+published curves are scored alongside as the reference the system has to
+improve on. The scope is the `r length(codes)` cities of `r cfg$region_focus`
+(`r paste(city_names, collapse = ", ")`), over every summer for which a
+rolling curve exists: 2014-2019 and 2023-`r format(data_end, "%Y")`.
+
+# Methods
+
+## Data
+
+Deaths: Istat daily deaths by comune of residence, aged 20+, summed over the
+comuni of each Urban Audit city (official Istat Cities 2021 composition),
+up to `r format(data_end, "%d %B %Y")`. Temperatures: daily mean ERA5-Land,
+averaged over the grid cells inside each city; the published study's own
+series up to 2019, an aligned reconstruction afterwards. City definitions,
+checks on deaths and population, and the alignment of the temperature series
+are described in full in the companion report; they are the same here.
+
+## Exposure-response curves
+
+**Published curves (reference).** For each city and age group, the published
+quadratic B-spline of daily mean temperature (knots at the 10th, 75th and
+90th percentiles of the city's 1990-2019 distribution, boundaries at its
+minimum and maximum) cumulated over lags 0-21, with its covariance matrix.
+For deaths 20+ the five age-specific relative risks are applied to the
+baseline of each age group.
+
+**Rolling curves (the system).** For every target month (`r paste(month.abb[rc$target_months], collapse = ", ")`):
+
+1. *Training window:* the last `r rc$train_years` years of days before the
+   month (`r if (identical(rc$update, "monthly")) "up to the last day of the previous month" else "up to 31 December of the previous year"`, and never after the last day of data), skipping every day of
+   `r paste(range(rc$skip_years), collapse = "-")` and counting back until
+   `r rc$train_years` years of days are collected. July 2024, for example, is
+   trained on July 2018-December 2019 plus January 2023-June 2024. A target
+   whose window would start before the first Istat day (1 January 2011) is not
+   predicted, so the first target is May 2014; targets in
+   `r paste(range(rc$skip_years), collapse = "-")` are not predicted.
+2. *First stage:* in every Italian city, deaths 20+ are modelled with the
+   published first-stage model - quasi-Poisson regression, cross-basis of
+   temperature (published knots) and lag (natural spline, lags 0-`r cfg$lag_max`,
+   `r cfg$lag_nknots` log-spaced knots), day of week, and a natural spline of
+   time with `r cfg$df_time_per_year` df per year fitted *separately in each
+   contiguous block of the window* (with its own intercept), so that the
+   2019-2023 gap does not consume degrees of freedom - and reduced to the
+   overall cumulative curve (five coefficients in the published basis).
+3. *Second stage:* the city fits are pooled in a multivariate random-effects
+   meta-analysis (REML; method of moments, then fixed effect, as fall-backs)
+   [@gasparrini2012; @sera2019]; every Italian city with at least
+   `r format(rc$min_deaths, big.mark = ",")` deaths in the window enters, and
+   every city that needs a curve is fitted whatever its size. Each city takes
+   its best linear unbiased prediction (BLUP), which shrinks a noisy city
+   towards the pooled curve.
+4. *Curve in force:* on a given day the system uses the curve of the latest
+   window that ended before that day. Every prediction is therefore made
+   with deaths that were available at the time: the evaluation is out of
+   sample.
+
+## Minimum mortality temperature
+
+For each curve the minimum mortality temperature (MMT) is found as in the
+published study: the log relative risk is evaluated on the city's
+temperature percentiles (0.1th to 99.9th) and the MMT is the percentile
+temperature with the lowest risk between the `r cfg$mmp_range[1]`th and the
+`r cfg$mmp_range[2]`th percentile. The relative risk is centred on it,
+RR(MMT) = 1. Each rolling curve has its own MMT, so it can move from month to
+month; for the published curves each age group has its own. Days at or above
+the MMT are *heat days*; days below carry the cold side of the curve, which
+is not part of heat deaths.
+
+## Deaths expected without heat
+
+For every city and age group, the baseline $B_t$ is a quasi-Poisson model of
+daily deaths with day of the week, a natural spline of time
+(`r cfg$baseline_trend_df_per_year` df per year) and
+`r cfg$baseline_harmonics` annual sine-cosine pair, fitted only on reference
+days: outside `r paste(month.abb[cfg$baseline_exclude_months], collapse = ", ")`
+(influenza) and not within `r cfg$baseline_hot_lag` days after a day at or above
+the MMT. `r if (isTRUE(cfg$baseline_cold_offset)) "The published cold relative risk enters as an offset on reference days, so $B_t$ is the number of deaths expected at the MMT." else ""`
+It is fitted separately for 2011-2019 and for 2023 onwards. Groups with fewer
+than `r cfg$baseline_min_daily` deaths a day use the 20+ model times their
+share of deaths.
+
+## Predicted deaths
+
+With $RR_t$ the relative risk of day $t$'s temperature (centred on the MMT):
+
+- deaths expected with that day's temperature: $E_t = B_t \, RR_t$;
+- heat deaths: $P = \sum_t B_t (RR_t - 1)$ over the heat days of a window;
+- observed heat deaths, against which $P$ is checked: $X = O - B$, observed
+  minus expected without heat, over the same window.
+
+The cumulative relative risk carries the effect of a day's temperature over
+the following `r cfg$lag_max` days and is assigned to that day, as in the
+published attribution.
+
+## Uncertainty
+
+Three sources are combined by simulation (`r format(cfg$nsim, big.mark = ",")` draws):
+
+- **curve:** coefficient vectors drawn from the multivariate normal of the
+  BLUP (rolling) or the published simulations (published), the MMT held at
+  its point estimate;
+- **baseline level:** one log-normal multiplier per draw, with the standard
+  deviation of the baseline model's predictions, shared by all the days of a
+  window (an error in the level of $B$ is common to neighbouring days);
+- **counts:** observed deaths drawn as negative binomial around each draw's
+  $E$, with the overdispersion $\phi$ of the baseline model (variance =
+  $\phi \times$ mean).
+
+The *confidence interval* of $P$ uses the first two; the *prediction
+interval* of the observed deaths $O$ uses all three, and is the grey band of
+the app (for a 7-day mean, the draws are averaged over the 7 days before
+taking quantiles).
+
+## Episodes and summers
+
+A **heatwave episode** is a spell of at least `r cfg$hw_min_days` days in
+`r paste(month.abb[range(cfg$warm_months)], collapse = "-")` with daily mean
+temperature at or above the city's `r cfg$hw_pct`th percentile of 1990-2019,
+spells separated by at most `r cfg$hw_max_gap` day being merged; its window
+runs to `r cfg$tail_days` days after the last hot day, to include delayed
+deaths. **Whole summers** (June-September) are scored as well, since they do
+not depend on the episode definition. Episodes are defined on temperature
+only, never on deaths.
+
+## Significant excess, observed and forecast
+
+For each episode window, the **no-heat range** is the 95% prediction
+interval of deaths if there were no heat: $B$ with its level uncertainty and
+negative binomial noise. Then:
+
+- a **significant excess was observed** when $O$ is above the upper end of
+  the no-heat range;
+- a **significant excess was forecast** (a warning) when the deaths the
+  curves expect, $E = \sum_t B_t RR_t$, are above that same upper end.
+
+## Calibration
+
+Across episodes (and, separately, summers):
+
+- *ratio of totals:* $\sum X / \sum P$, 1 if the system predicts as many heat
+  deaths as were observed;
+- *calibration slope:* weighted least squares of $X$ on $P$ through the
+  origin, weights $1/\mathrm{Var}(O)$; below 1 the system over-predicts, and
+  more so for larger episodes;
+- *correlation* of $X$ and $P$, and *mean absolute error* per episode;
+- *coverage:* share of episodes whose observed deaths fall inside the 95%
+  prediction interval (95% expected);
+
+overall, for **large episodes** (published prediction in the top
+`r pct(1 - rc$large_quantile)` - a function of temperatures and baseline only,
+so the same episodes for both sets of curves and no selection on the
+outcome), and for **episodes with a significant observed excess** (selected on
+the outcome: chance pushes these up, so any set of curves looks a little low
+on them; useful to compare the two sets, not as an absolute measure).
+
+## Warning skill
+
+Warnings and observed excesses form a 2 x 2 table over all episodes: hits
+($a$), false alarms ($b$), misses ($c$), correct negatives ($d$). Scores
+[@jolliffe2012; @wilks2019]:
+
+- probability of detection $\mathrm{POD} = a/(a+c)$;
+- false alarm ratio $\mathrm{FAR} = b/(a+b)$;
+- critical success index $\mathrm{CSI} = a/(a+b+c)$;
+- frequency bias $(a+b)/(a+c)$, 1 when there are as many warnings as events;
+- Peirce skill score $\mathrm{PSS} = a/(a+c) - b/(b+d)$;
+- Heidke skill score $\mathrm{HSS} = 2(ad - bc)/[(a+c)(c+d) + (a+b)(b+d)]$,
+  0 for chance, 1 for perfect.
+
+## Timing check
+
+Within each city and summer, daily excess deaths and temperature (both centred
+on their summer means) are correlated with temperature shifted by -10 to +10
+days. Deaths must follow temperature (peak at 0 to +2 days); a negative peak
+would reveal a date misalignment between deaths and temperatures.
+
+## Readiness criteria
+
+Fixed before the results were produced (configuration `readiness`); the
+verdict is "ready" when all are met, "ready with caveats" when only non-core
+ones fail, "not ready" when a core one fails.
+
+```{r criteria-def}
+kbl(rbindlist(lapply(cfg$readiness, function(r) data.table(
+  Criterion = r$label, `Accepted range` = sprintf("%g to %g", r$lo, r$hi),
+  Core = fifelse(r$core, "yes", "no")))))
+```
+
+# Results
+
+## Episodes and timing
+
+```{r ep-summary}
+if (has_roll) {
+  w <- re$windows[curves == SYS & type %in% c("episode", "summer")]
+  kbl(w[, .(Windows = .N, Cities = uniqueN(URAU_CODE),
+            `Observed deaths` = fmt(sum(O), 0), `Expected without heat` = fmt(sum(B), 0),
+            `Observed heat deaths` = fmt(sum(X), 0),
+            `With significant excess` = sum(obs_sig, na.rm = TRUE)),
+          by = .(Period = period, Type = type)],
+      caption = "Windows scored (only those with a rolling curve in force on every day)")
+}
+```
+
+```{r timing, fig.height=3.2}
+if (length(tm)) {
+  cc <- rbindlist(lapply(names(tm), function(p) cbind(period = p, tm[[p]]$ccf)))
+  pk <- cc[, .SD[which.max(r)], by = period]
+  ggplot(cc, aes(lag, r, colour = period)) + geom_vline(xintercept = 0, colour = "grey60") +
+    geom_line() + geom_point(data = pk, size = 2.5) +
+    labs(x = "Days by which deaths follow temperature", y = "Correlation", colour = NULL) +
+    theme(legend.position = "bottom")
+}
+```
+
+`r if (length(tm)) sprintf("Deaths follow temperature: the correlation peaks at %s.", paste(sprintf("%+d days (%s)", pk$lag, pk$period), collapse = " and ")) else ""`
+
+## The rolling curves
+
+```{r targets-table}
+if (!is.null(rl))
+  kbl(rl$targets[, .(Months = .N, First = min(key), Last = max(key)), by = .(Status = status)],
+      caption = "Target months")
+```
+
+```{r trajectory, fig.height=7}
+#| fig-cap: "Heat relative risk at the 99th percentile (vs the curve's own MMT) of the rolling curve in force in each month, with its 95% interval; dashed: published curves."
+if (has_roll && nrow(rl$summary)) {
+  s <- merge(rl$summary[URAU_CODE %in% codes], nm_city, by = "URAU_CODE")
+  s[, era := train_end < as.Date(sprintf("%d-01-01", min(rc$skip_years)))]
+  ggplot(s, aes(train_end + 1, rr99, group = era)) +
+    geom_hline(yintercept = 1, colour = "grey80") +
+    geom_ribbon(aes(ymin = rr99_lo, ymax = rr99_hi), fill = "grey80") +
+    geom_line(aes(y = rr99_pub), colour = "firebrick", linetype = 2) +
+    geom_line(colour = "grey20") +
+    facet_wrap(~ name) +
+    labs(x = "Month the curve is used for", y = "RR at P99")
+}
+```
+
+```{r mmt-roll, fig.height=4}
+#| fig-cap: "Minimum mortality temperature of the rolling curves, by month."
+if (has_roll && nrow(rl$summary)) {
+  s <- merge(rl$summary[URAU_CODE %in% codes], nm_city, by = "URAU_CODE")
+  s[, era := train_end < as.Date(sprintf("%d-01-01", min(rc$skip_years)))]
+  ggplot(s, aes(train_end + 1, mmt, colour = name, group = interaction(name, era))) +
+    geom_line() + labs(x = NULL, y = "MMT (°C)", colour = NULL) +
+    theme(legend.position = "bottom")
+}
+```
+
+## Calibration of predicted heat deaths
+
+```{r calibration, results='asis'}
+if (has_roll) {
+  cl <- re$calibration
+  print(kbl(cl[, .(Period = period, Windows = fifelse(type == "episode", "Episodes", "Summers"),
+                   Subset = subset, Curves = curves, N = n,
+                   Observed = fmt(observed, 0), Predicted = fmt(predicted, 0),
+                   `Obs / pred` = fmt(ratio),
+                   Slope = sprintf("%s (%s-%s)", fmt(slope), fmt(lo), fmt(hi)),
+                   r = fmt(r), MAE = fmt(mae, 1), `95% PI coverage` = pct(coverage_95))],
+            caption = sprintf("Observed vs predicted heat deaths (slope 1 = calibrated). Large episodes: published prediction above %s deaths.",
+                              fmt(re$large_threshold, 1))))
+}
+```
+
+```{r cal-numbers}
+if (has_roll) {
+  g <- function(sub, cur) re$calibration[period == ap & subset == sub & type == "episode" & curves == cur]
+  pa <- g("All windows", PUB); sa <- g("All windows", SYS)
+  pl <- g("Large episodes", PUB); sl_ <- g("Large episodes", SYS)
+  ok_num <- nrow(pa) && nrow(sa); ok_lg <- nrow(pl) && nrow(sl_)
+}
+```
+
+`r if (has_roll && ok_num) sprintf("Over %s, the system predicts %s heat deaths in the episodes against %s observed (ratio %s, slope %s); the published curves predict %s (ratio %s). %s of the episodes fall inside the system's 95%% prediction interval.", if (ap == "All periods") "all the years scored" else ap, fmt(sa$predicted, 0), fmt(sa$observed, 0), fmt(sa$ratio), fmt(sa$slope), fmt(pa$predicted, 0), fmt(pa$ratio), pct(sa$coverage_95)) else ""`
+`r if (has_roll && ok_lg) sprintf("On large episodes the ratio is %s for the system and %s for the published curves (mean absolute error %s and %s deaths per episode).", fmt(sl_$ratio), fmt(pl$ratio), fmt(sl_$mae, 1), fmt(pl$mae, 1)) else ""`
+
+The chart keeps the episodes with a significant observed excess, the ones a
+warning system exists for.
+
+```{r scatter, fig.height=5.5}
+if (has_roll) {
+  w <- re$windows[type == "episode" & obs_sig == TRUE]
+  w[, curves := factor(curves, re$curve_sets)]
+  sl <- re$calibration[period == ap & type == "episode" & subset == "Episodes with significant excess"]
+  ggplot(w, aes(P, X)) + geom_hline(yintercept = 0, colour = "grey85") +
+    geom_abline(colour = "grey40", linetype = 2) +
+    geom_abline(data = sl, aes(slope = slope, intercept = 0), colour = "firebrick") +
+    geom_errorbar(aes(ymin = pi_lo - B, ymax = pi_hi - B), colour = "grey80", width = 0) +
+    geom_point(aes(colour = size), alpha = .8) +
+    scale_colour_manual(values = c(Large = "firebrick", Other = "grey40")) +
+    facet_wrap(~ curves, nrow = 1) +
+    labs(x = "Predicted heat deaths", y = "Observed heat deaths (O - B)", colour = "Episode",
+         subtitle = "Dashed: perfect calibration; red: fitted slope; bars: 95% prediction range") +
+    theme(legend.position = "bottom")
+}
+```
+
+```{r largest}
+if (has_roll) {
+  w <- merge(re$windows[type == "episode"], nm_city, by = "URAU_CODE")
+  pub <- w[curves == PUB, .(period, id, name, start, end, O, B, X, P_pub = P, sig = obs_sig)]
+  sys <- w[curves == SYS, .(period, id, P_sys = P, lo = pi_lo - B, hi = pi_hi - B, in_pi)]
+  top <- merge(pub, sys, by = c("period", "id"))[order(-P_pub)][seq_len(min(15, .N))]
+  kbl(top[, .(name, start, end, fmt(O, 0), fmt(B, 0), fmt(X, 0), fmt(P_pub, 0), fmt(P_sys, 0),
+              sprintf("%s to %s", fmt(lo, 0), fmt(hi, 0)), in_pi, fifelse(sig, "yes", "no"))],
+      col.names = c("City", "Start", "End", "Observed", "Expected without heat",
+                    "Observed heat deaths", "Published", "System", "System: 95% range",
+                    "In range", "Significant excess"),
+      caption = "Largest episodes: predicted heat deaths and the system's 95% range for the observed ones")
+}
+```
+
+```{r by-year, fig.height=4}
+if (has_roll) {
+  by <- re$by_year[type == "episode"]
+  obs <- by[, .(X = X[1]), by = year]
+  ggplot(by, aes(factor(year), P, fill = curves)) +
+    geom_col(position = position_dodge(width = .8), width = .75) +
+    geom_point(data = obs, aes(factor(year), X), inherit.aes = FALSE, shape = 23, size = 3,
+               fill = "black") +
+    labs(x = NULL, y = "Heat deaths, all episodes", fill = NULL,
+         subtitle = "Bars: predicted; diamonds: observed") +
+    theme(legend.position = "bottom")
+}
+```
+
+## Daily prediction band
+
+For every summer day of `r if (!is.null(rx)) rx$city else "the example city"`,
+the grey band is the 95% prediction interval of the system; days outside it
+are marked. A calibrated band leaves about 2.5% of days on each side.
+
+```{r band, fig.height=11}
+if (!is.null(rx)) {
+  d <- copy(rx$data)
+  d[, flag := factor(flag, c("above", "below", "within"),
+                     c("Above the band", "Below the band", "Within"))]
+  share <- d[, .(above = mean(flag == "Above the band"), below = mean(flag == "Below the band"))]
+  ggplot(d, aes(date)) +
+    geom_ribbon(aes(ymin = pi_lo, ymax = pi_hi), fill = "grey80") +
+    geom_line(aes(y = B, colour = "Expected without heat"), linewidth = .5, linetype = 2) +
+    geom_line(aes(y = pred_pub, colour = "Published curves"), linewidth = .5) +
+    geom_line(aes(y = pred, colour = "System (rolling curves)"), linewidth = .7) +
+    geom_point(aes(y = observed, shape = flag, alpha = flag == "Within"), size = 1.1) +
+    scale_alpha_manual(values = c(`TRUE` = .35, `FALSE` = 1), guide = "none") +
+    scale_shape_manual(values = c(`Above the band` = 17, `Below the band` = 25, Within = 16)) +
+    scale_colour_manual(values = c(`Expected without heat` = "steelblue",
+                                   `Published curves` = "firebrick",
+                                   `System (rolling curves)` = "#1B7837")) +
+    facet_wrap(~ year, ncol = 2, scales = "free_x") +
+    labs(x = NULL, y = "Deaths per day (20+)", colour = NULL, shape = "Observed",
+         subtitle = sprintf("Days above the band: %s; below: %s", pct(share$above, 1),
+                            pct(share$below, 1))) +
+    theme(legend.position = "bottom")
+}
+```
+
+## Warnings
+
+```{r matrix, results='asis'}
+if (has_roll && !is.null(re$warnings)) {
+  for (cs in re$curve_sets) {
+    x <- re$warnings[period == ap & curves == cs]
+    if (!nrow(x)) next
+    m <- data.table(` ` = c("Excess forecast", "No excess forecast"),
+                    `Excess observed` = c(x$hits, x$misses),
+                    `No excess observed` = c(x$false_alarms, x$correct_negatives))
+    print(kbl(m, caption = sprintf("%s: %d episodes", cs, x$n)))
+    cat("\n\n")
+  }
+}
+```
+
+```{r scores}
+if (has_roll && !is.null(re$warnings))
+  kbl(re$warnings[, .(Period = period, Curves = curves, Episodes = n, Hits = hits,
+                      `False alarms` = false_alarms, Misses = misses,
+                      `Correct negatives` = correct_negatives, POD = fmt(pod), FAR = fmt(far),
+                      CSI = fmt(csi), Bias = fmt(bias), PSS = fmt(pss), HSS = fmt(hss))],
+      caption = "Warning scores")
+```
+
+```{r episodes-list}
+if (has_roll) {
+  w <- merge(re$windows[type == "episode"], nm_city, by = "URAU_CODE")
+  oc <- function(o, f) fifelse(o & f, "Hit", fifelse(o & !f, "Missed",
+                         fifelse(!o & f, "False alarm", "")))
+  pub <- w[curves == PUB, .(period, id, name, start, end, O, nh_hi, X, obs_sig, P_pub = P,
+                            out_pub = oc(obs_sig, fc_sig))]
+  sys <- w[curves == SYS, .(period, id, P_sys = P, lo = pi_lo - B, hi = pi_hi - B,
+                            out_sys = oc(obs_sig, fc_sig))]
+  wl <- merge(pub, sys, by = c("period", "id"))[obs_sig | out_pub != "" | out_sys != ""][
+    order(start, name)]
+  kbl(wl[, .(name, start, end, fmt(O, 0), fmt(nh_hi, 0), fmt(X, 0), fifelse(obs_sig, "yes", "no"),
+             fmt(P_pub, 0), out_pub, fmt(P_sys, 0), sprintf("%s to %s", fmt(lo, 0), fmt(hi, 0)),
+             out_sys)],
+      col.names = c("City", "Start", "End", "Observed", "No-heat upper bound",
+                    "Observed heat deaths", "Significant excess", "Published",
+                    "Published: warning", "System", "System: 95% range", "System: warning"),
+      caption = "Every episode with a significant excess observed or forecast by either set of curves")
+}
+```
+
+# Discussion
+
+## Is the system ready?
+
+```{r readiness}
+if (!is.null(rd))
+  kbl(rd$criteria[, .(Criterion = criterion, `Accepted range` = range,
+                      Core = fifelse(core, "yes", "no"), System = system,
+                      `Published (reference)` = published,
+                      Met = fifelse(pass, "yes", "**no**"))],
+      caption = sprintf("Readiness criteria, %s", tolower(rd$period)))
+```
+
+```{r disc}
+fails <- if (!is.null(rd)) rd$criteria[pass == FALSE] else data.table()
+```
+
+**Verdict: `r if (!is.null(rd)) rd$verdict else "n/a"`.**
+`r if (!is.null(rd) && !nrow(fails)) "Every criterion is met: on recorded temperatures the system predicts the heat deaths of the region's heatwaves without systematic bias, its 95% ranges contain the observed deaths about as often as they should, and it warns of abnormal excess with few misses and few false alarms." else if (!is.null(rd)) sprintf("Criteria not met: %s.", paste(sprintf("%s (%s, accepted %s)", tolower(fails$criterion), fails$system, fails$range), collapse = "; ")) else ""`
+`r if (!is.null(rd) && has_roll && ok_num) sprintf("Against the published curves, the system moves the ratio of observed to predicted heat deaths from %s to %s.", fmt(pa$ratio), fmt(sa$ratio)) else ""`
+
+**What this validation covers.** The chain from temperature to deaths, with
+the temperatures that occurred, scored out of sample (every curve uses only
+deaths available before the month it predicts) over
+`r if (!is.null(re)) paste(head(re$periods, -1), collapse = " and ") else ""`,
+with fixed criteria. It does not cover the temperature forecast: in operation
+the system will receive forecasts 1-7 days ahead, whose errors (a warm bias
+on hot days, growing with lead time) add to the ranges above. That is the
+next validation step.
+
+**Known limitations.**
+
+- *Depletion within long episodes.* The curves have no memory of how long
+  the heat has lasted; in long episodes deaths can peak before the hottest
+  days because the most vulnerable die first. Over-prediction concentrated in
+  long episodes points here.
+- *Baseline level.* Observed heat deaths are measured against the baseline,
+  whose level is anchored by the published cold effect; a few percent of
+  error in it moves observed heat deaths by much more, in either direction.
+- *Few events.* `r n_ep` episodes in `r length(codes)` cities; small cities
+  contribute few deaths each, and the scores have wide uncertainty.
+- *First post-COVID windows* mix 2017-2019 with the first months of 2023 and
+  the mortality deficit that followed the pandemic.
+
+**Recommendations.** `r if (!is.null(rd) && rd$verdict != "Not ready") "Use the rolling curves, not the published ones, for operational numbers; report the 95% range with every number; and repeat this validation each year with the new Istat release, before each summer, adding the forecast step." else "Do not use the numbers operationally until the core criteria are met; investigate the failing criteria first (depletion in long episodes and the baseline level are the first suspects)."`
+
+# References {.unnumbered}
+
+::: {#refs}
+:::
+
+# Appendix {.appendix}
+
+## Configuration
+
+```{r config}
+keep <- c("region_focus", "rolling", "lag_max", "lag_nknots", "var_pct", "var_degree",
+          "df_time_per_year", "mmp_range", "rr_pct", "nsim", "hw_pct", "hw_min_days",
+          "hw_max_gap", "warm_months", "tail_days", "baseline_exclude_months",
+          "baseline_hot_lag", "baseline_harmonics", "baseline_trend_df_per_year",
+          "baseline_min_daily", "baseline_cold_offset", "seed")
+kbl(data.table(Parameter = keep,
+               Value = vapply(cfg[keep], function(v) paste(format(v), collapse = ", "), "")))
+```
