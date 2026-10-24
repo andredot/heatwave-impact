@@ -173,7 +173,8 @@ score_windows <- function(daily, wins, provider, label, erf, cfg) {
 #'
 #' @return List with `windows` (long, with `nh_lo`, `nh_hi`, `obs_sig`,
 #'   `fc_sig`), `calibration` (by period and over all periods: all windows,
-#'   large episodes, episodes with significant excess), `warnings`,
+#'   large episodes, episodes with significant excess), `warnings`, `cities`
+#'   (episodes city by city, all periods),
 #'   `by_year`, `displacement`, `large_threshold`, `curve_sets`.
 rolling_evaluation <- function(sources, roll, recals, erf, cfg, codes) {
   rows <- list(); nhs <- list()
@@ -266,8 +267,16 @@ rolling_evaluation <- function(sources, roll, recals, erf, cfg, codes) {
     groups[[p]][type == "episode", warning_scores(obs_sig, fc_sig), by = curves][
       , period := p]))
   warn[, `:=`(curves = factor(curves, ord), period = factor(period, names(groups)))]
+  # city by city, over all periods: the system is used city by city
+  cities <- long[type == "episode" & curves %in% unique(groups[[length(groups)]]$curves),
+                 c(list(episodes = .N, observed = sum(X), predicted = sum(P),
+                        ratio = sum(X) / sum(P), coverage_95 = mean(in_pi)),
+                   as.list(warning_scores(obs_sig, fc_sig)[, .(hits, false_alarms, misses,
+                                                              correct_negatives)])),
+                 by = .(URAU_CODE, curves)]
+  cities[, curves := factor(curves, ord)]
   list(windows = long[], calibration = cal[order(period, subset, type, curves)],
-       warnings = warn[order(period, curves)],
+       warnings = warn[order(period, curves)], cities = cities[order(URAU_CODE, curves)],
        by_year = by_year[order(type, year, curves)],
        displacement = disp[order(period, curves, type)], large_threshold = thr,
        curve_sets = ord, periods = names(groups))

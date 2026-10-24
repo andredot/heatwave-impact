@@ -249,7 +249,11 @@ study required `r format(cfg$min_deaths, big.mark = ",")` deaths per series); sm
 cities are handled by the second stage. A model that does not converge is
 recorded and the city takes the pooled curve.
 
-**Windows.** `r paste(win_lab, collapse = ", ")`. Windows ending by 2019 use
+**Windows.** `r paste(win_lab, collapse = ", ")`. Windows are five years long
+where the data allow: five years give a city several summers and enough deaths
+for a stable fit, while still separating periods a decade apart. The years
+before COVID-19 hold one full window and four further years; the years after
+it hold three and a half, so the last two windows are shorter. Windows ending by 2019 use
 the published study's temperature series, later ones the aligned
 reconstruction. 2020-2022 are excluded: COVID-19 caused excess deaths of a
 size and timing (including the spring and autumn waves) that a seasonal
@@ -543,8 +547,10 @@ removes the effect of hotter summers and of changing death counts.
   still carry the mortality deficit that followed the pandemic's excess
   deaths (frail people who died earlier are not there to die of heat), which
   would lower its heat risk for reasons other than adaptation.
-- *Window length.* Three years give few deaths in small cities; their curves
-  lean on the pooled one, and their contribution to the trend is small.
+- *Window length and number.* Five-year windows steady the city fits but leave
+  only `r nrow(ad$pooled)` windows, and the last ones are shorter
+  (`r paste(win_lab[-1], collapse = ", ")`); the trend rests on few points and
+  small cities still lean on the pooled curve.
 - *Deaths by residence.* Istat counts deaths by comune of residence, as did
   the published study; deaths of commuters or tourists are not assigned to
   the city where heat was experienced.

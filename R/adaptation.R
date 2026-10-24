@@ -3,7 +3,8 @@
 #
 #  The published curves describe Italian mortality of 2001-2010. Here the same
 #  first-stage model is refitted on consecutive, non-overlapping windows of
-#  Istat deaths (cfg$adaptation$windows), every city in every window, and the
+#  Istat deaths (cfg$adaptation$windows, five years where the data allow), every
+#  city in every window, and the
 #  city curves are pooled and shrunk as in Masselot's second stage. Three
 #  measures of heat vulnerability are compared across windows:
 #    1. the heat relative risk at the 99th percentile, against the published

@@ -17,7 +17,7 @@ suppressPackageStartupMessages({
 })
 for (f in c("R/config.R", "R/utils.R", "R/erf.R", "R/curves.R", "R/episodes.R",
             "R/recalibrate.R", "R/rolling.R", "R/rolling_eval.R", "R/lag_check.R",
-            "R/adaptation.R")) source(f)
+            "R/adaptation.R", "R/baseline_audit.R")) source(f)
 set.seed(1)
 cfg$nsim <- 200
 cfg$rolling$pool <- "region"
@@ -168,6 +168,14 @@ ep_t <- detect_episodes(test_expo, erf, as.Date("2023-01-01"), data_end, cfg2)
 cf_t <- fit_counterfactual(mort, test_expo, ep_t, erf, as.Date("2023-01-01"), data_end, cfg2)
 ev_t <- evaluate_counterfactual(cf_t, cfg2)
 check("phi" %in% names(cf_t$daily), "counterfactual daily carries the dispersion")
+# whole heatwaves: no two windows of a city touch or overlap
+ovl <- rbind(ep_h, ep_t)[order(URAU_CODE, start)][
+  , .(gap = as.integer(shift(start, -1) - win_end)), by = URAU_CODE][!is.na(gap)]
+check(nrow(ovl) > 0 && all(ovl$gap > 1), "heatwave windows never touch or overlap")
+ep_raw <- detect_episodes(test_expo, erf, as.Date("2023-01-01"), data_end,
+                          modifyList(cfg2, list(hw_merge_windows = FALSE)))
+cat(sprintf("  episodes 2023-: %d separate spells -> %d whole heatwaves\n", nrow(ep_raw), nrow(ep_t)))
+check(nrow(ep_t) <= nrow(ep_raw) && sum(ep_t$spells) >= nrow(ep_t), "merging only joins episodes")
 recal <- list(recalibrate_curves(mort, hist_expo, erf, c("2016-01-01", "2019-12-31"), cfg2))
 re <- rolling_evaluation(
   list(list(label = "2011-2019", cf = cf_h, ev = ev_h, recals = FALSE),
@@ -206,15 +214,15 @@ ad <- run_adaptation(mort, hist_expo, test_expo, erf, data_end, cfg3)
 print(ad$pooled[, .(window, k, ratio = round(ratio, 3), lo = round(lo, 3), hi = round(hi, 3))])
 print(ad$af[, .(window, af = round(af, 4), lo = round(lo, 4), hi = round(hi, 4))])
 print(ad$trend)
-check(nrow(ad$pooled) == 4, "four adaptation windows")
-check(ad$pooled$ratio[4] < ad$pooled$ratio[1], "heat RR ratio falls from the first to the last window")
+check(nrow(ad$pooled) == length(cfg3$adaptation$windows), "one result per adaptation window")
+check(ad$pooled$ratio[nrow(ad$pooled)] < ad$pooled$ratio[1], "heat RR ratio falls from the first to the last window")
 check(nrow(ad$trend) >= 1 && ad$trend$change_per_decade[1] < 1, "trend per decade below 1")
 check(ad$af$af[1] > max(ad$af$af[-1]), "published curves give the largest standardised AF")
-check(ad$af$af[2] > ad$af$af[5], "standardised AF falls from the first to the last window")
+check(ad$af$af[2] > ad$af$af[nrow(ad$af)], "standardised AF falls from the first to the last window")
 check(ad$af_trend$change_per_decade < 1, "standardised AF trend below 1")
 dr <- summer_dose_response(list(cf_h, cf_t), erf, cfg3)
 print(dr$slopes)
-check(!is.null(dr) && nrow(dr$slopes) == 4 && all(dr$slopes$slope_pct > 0),
+check(!is.null(dr) && nrow(dr$slopes) == length(cfg3$adaptation$windows) && all(dr$slopes$slope_pct > 0),
       "dose-response: one positive slope per window")
 
 # ---- readiness (Report 2) ---------------------------------------------------------
@@ -228,8 +236,22 @@ check(nrow(rd$criteria) == length(cfg2$readiness) && rd$verdict %in%
         c("Ready", "Ready with caveats", "Not ready"), "readiness check runs")
 check(setequal(re1$curve_sets, c(PUBLISHED_LABEL, roll$label)), "system validation: published + rolling only")
 
+# ---- baseline audit (Report 2) ------------------------------------------------------
+cat("Baseline audit\n")
+pr <- list(test = list(start = as.Date("2023-01-01"), end = data_end))
+ba <- baseline_sensitivity(list(`Two seasonal harmonics` = list(baseline_harmonics = 2)),
+                           mort, hist_expo, test_expo, ep_h, ep_t, erf, cfg2, codes, roll, pr,
+                           re1, cf_h, cf_t)
+print(ba$cool_pooled[, .(baseline, period, season, ratio = round(ratio, 3))])
+print(ba$sensitivity[, .(baseline, curves, ratio = round(ratio, 2), events, summer_excess_pct)])
+check(nrow(ba$sensitivity) == 4 && all(c("Summer (Jun-Sep)", "Spring and autumn") %in% ba$cool_pooled$season),
+      "baseline audit: cool days and two baselines x two curve sets")
+check(all(abs(ba$cool_pooled[season == "Spring and autumn", ratio] - 1) < .05),
+      "spring and autumn cool days close to 1 (they dominate the fit)")
+check(!is.null(re1$cities) && nrow(re1$cities) == 2 * length(codes), "results city by city")
+
 out <- Sys.getenv("ROLLING_TEST_OUT")   # keep the objects, e.g. to try the app on them
-if (nzchar(out)) saveRDS(list(roll = roll, sets = sets, re = re, re1 = re1, rd = rd, ad = ad,
+if (nzchar(out)) saveRDS(list(roll = roll, sets = sets, re = re, re1 = re1, rd = rd, ad = ad, ba = ba,
                               dr = dr, lc = list(`2011-2019` = lag_check(cf_h, ep_h),
                                                  `2023 onwards` = lag_check(cf_t, ep_t)),
                               cf_h = cf_h, ex = ex, cf_t = cf_t, erf = erf,

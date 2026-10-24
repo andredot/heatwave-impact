@@ -240,3 +240,19 @@ Status: FIRST VERSION, checked on simulated data only.
   (`target_months = 4:9`), and the 2011-2019 counterfactual is fitted for every city:
   the app shows every summer (1 April - 30 September) from the bundle, without
   downloads. Expect a longer first `tar_make()`.
+
+## 9. Validation fixes after the first real run (branch rolling-recalibration-lombardy)
+- First real run: 245 city-episodes, only 8 with a significant excess (6 in Milan);
+  calibration chart shown on those 8 looked good (ratio 1.08) because they were
+  selected on the outcome; all episodes 0.48. Whole summers 2023-2026: observed
+  excess ~0 while the curves predict ~2,500 -> yardstick suspected.
+- Done: touching/overlapping episode windows merged into whole heatwaves
+  (`hw_merge_windows`); scoring stays city by city, with a per-city table
+  (`roll_eval$cities`); baseline audit (`R/baseline_audit.R`, target
+  `baseline_audit`): cool-day observed/expected and the whole evaluation repeated
+  with `cfg$baseline_variants`. Report 1 windows now 5 years where possible
+  (2011-2015, 2016-2019, 2023-2026).
+- Synthetic check of the audit: cool days pass (99%) while two harmonics move the
+  ratio 0.71 -> 0.88: the sensitivity table, not the cool-day check, is the test.
+- Still open: probabilistic warnings (Brier, reliability, ROC) and confidence
+  intervals on the scores; readiness criteria amendments must be dated.

@@ -3,15 +3,20 @@
 #' An episode is a spell of at least `hw_min_days` days in the warm season
 #' with daily mean temperature at or above the city's `hw_pct` percentile of
 #' its 1990-2019 distribution (the same distribution behind the ERF);
-#' spells separated by at most `hw_max_gap` days are merged. Only episodes
-#' whose evaluation window (episode + `tail_days`) ends within the period
-#' are kept.
+#' spells separated by at most `hw_max_gap` days are merged. Each episode is
+#' scored over a window that runs `tail_days` after its last hot day; with
+#' `hw_merge_windows`, episodes whose windows touch or overlap the next
+#' episode (next start no later than the day after the window ends) are
+#' merged into one, so a long hot period broken by short cooler spells is one
+#' heatwave and no death is counted in two windows. Only episodes whose
+#' window ends within the period are kept.
 #'
 #' @param expo Exposure data.table (`URAU_CODE`, `date`, `tmean`).
 #' @param erf Output of [read_erf_bundle()].
 #' @param start,end Period.
 #' @param cfg Configuration list.
-#' @return data.table with one row per episode.
+#' @return data.table with one row per episode (`spells` = hot spells merged
+#'   into it).
 detect_episodes <- function(expo, erf, start, end, cfg) {
   out <- lapply(unique(expo$URAU_CODE), function(cd) {
     thr <- pct_value(erf$tdist[URAU_CODE == cd], cfg$hw_pct)
@@ -21,21 +26,33 @@ detect_episodes <- function(expo, erf, start, end, cfg) {
     r <- rle(hot); e_i <- cumsum(r$lengths); s_i <- e_i - r$lengths + 1
     sp <- data.table::data.table(s = x$date[s_i[r$values]], e = x$date[e_i[r$values]])
     if (!nrow(sp)) return(NULL)
-    merged <- sp[1]
-    if (nrow(sp) > 1) for (k in 2:nrow(sp)) {
-      last <- nrow(merged)
-      if (as.integer(sp$s[k] - merged$e[last]) - 1 <= cfg$hw_max_gap) {
-        merged$e[last] <- sp$e[k]
-      } else merged <- rbind(merged, sp[k])
+    # merge spells separated by short gaps
+    join <- function(d, gap) {
+      m <- d[1]
+      if (nrow(d) > 1) for (k in 2:nrow(d)) {
+        last <- nrow(m)
+        if (as.integer(d$s[k] - m$e[last]) - 1 <= gap) {
+          m$e[last] <- max(m$e[last], d$e[k]); m$spells[last] <- m$spells[last] + d$spells[k]
+        } else m <- rbind(m, d[k])
+      }
+      m
     }
+    sp[, spells := 1L]
+    merged <- join(sp, cfg$hw_max_gap)
+    inwin <- function(k, m) x$date >= m$s[k] & x$date <= m$e[k]
+    merged[, hot_days := vapply(seq_len(.N), function(k) sum(hot[inwin(k, merged)]), 0L)]
+    merged <- merged[hot_days >= cfg$hw_min_days]
+    if (!nrow(merged)) return(NULL)
+    # whole heatwaves: an episode starting within the window of the previous one
+    # (its last hot day + tail_days, and the day after) is the same heatwave
+    if (!isFALSE(cfg$hw_merge_windows)) merged <- join(merged[, .(s, e, spells)], cfg$tail_days)
     merged[, `:=`(URAU_CODE = cd, thr = thr)]
-    inwin <- function(k) x$date >= merged$s[k] & x$date <= merged$e[k]
-    merged[, hot_days := vapply(seq_len(.N), function(k) sum(hot[inwin(k)]), 0L)]
-    merged[, t_mean := vapply(seq_len(.N), function(k) mean(x$tmean[inwin(k)]), 0)]
-    merged[, t_peak := vapply(seq_len(.N), function(k) max(x$tmean[inwin(k)]), 0)]
-    merged[hot_days >= cfg$hw_min_days & e + cfg$tail_days <= end]
+    merged[, hot_days := vapply(seq_len(.N), function(k) sum(hot[inwin(k, merged)]), 0L)]
+    merged[, t_mean := vapply(seq_len(.N), function(k) mean(x$tmean[inwin(k, merged)]), 0)]
+    merged[, t_peak := vapply(seq_len(.N), function(k) max(x$tmean[inwin(k, merged)]), 0)]
+    merged[e + cfg$tail_days <= end]
   })
-  ep <- data.table::rbindlist(out)
+  ep <- data.table::rbindlist(out, fill = TRUE)
   if (!nrow(ep)) return(ep)
   data.table::setnames(ep, c("s", "e"), c("start", "end"))
   ep[, `:=`(ndays = as.integer(end - start) + 1L,

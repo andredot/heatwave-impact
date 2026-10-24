@@ -144,6 +144,10 @@ list(
     `2023 onwards` = lag_check(list(daily = counterfactual$daily[URAU_CODE %in% eval_codes]),
                                episodes[URAU_CODE %in% eval_codes]))),
   tar_target(readiness, readiness_check(roll_eval, timing_region, rolling$label, config)),
+  # is the yardstick sound? cool-day check and alternative baselines
+  tar_target(baseline_audit, baseline_sensitivity(
+    config$baseline_variants, mort, era5_masselot, exposure_test, episodes_hist, episodes,
+    erf, config, eval_codes, rolling, periods, roll_eval, counterfactual_hist, counterfactual)),
 
   # ---- regional excess mortality (official FluMOMO code, app EuroMOMO tab) --
   tar_target(influenza_file, build_influenza_activity(config), format = "file"),

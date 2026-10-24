@@ -188,7 +188,8 @@ A **heatwave episode** is a spell of at least `r cfg$hw_min_days` days in
 temperature at or above the city's `r cfg$hw_pct`th percentile of 1990-2019,
 spells separated by at most `r cfg$hw_max_gap` day being merged; its window
 runs to `r cfg$tail_days` days after the last hot day, to include delayed
-deaths. **Whole summers** (June-September) are scored as well, since they do
+deaths. `r if (!isFALSE(cfg$hw_merge_windows)) sprintf("Episodes are then merged into **whole heatwaves**: when an episode starts within the window of the previous one (or the day after it ends), the two are one heatwave, scored over a single window from the first hot day to %d days after the last. No day, and no death, belongs to two windows, and a hot period broken by a few cooler days is judged as the one event it is.", cfg$tail_days) else ""`
+Every episode is scored in its own city: the system is used city by city. **Whole summers** (June-September) are scored as well, since they do
 not depend on the episode definition. Episodes are defined on temperature
 only, never on deaths.
 
@@ -244,6 +245,27 @@ on their summer means) are correlated with temperature shifted by -10 to +10
 days. Deaths must follow temperature (peak at 0 to +2 days); a negative peak
 would reveal a date misalignment between deaths and temperatures.
 
+## Baseline audit
+
+Observed heat deaths are measured against the baseline, $X = O - B$, so the
+level of $B$ decides them: a baseline 3% too high removes 3% of all deaths of
+a window from $X$, often most of the heat signal. Two checks:
+
+- **Cool days.** On the baseline's reference days (not hot, not just after
+  heat) the model expects $B$ times the cold relative risk; observed /
+  expected there should be 1. Spring and autumn days dominate the fit and
+  stay close to 1 by construction; summer reference days are few and lie
+  between hot spells, so a baseline whose summer level is off shows up there.
+  A ratio below 1 means $B$ is too high in summer and $X$ too low. Summer
+  reference days are themselves part of the fit, so the check is weak: a
+  baseline can pass it and still be off by a few percent in summer.
+- **Alternative baselines.** The baseline is refitted with alternative,
+  equally defensible choices
+  (`r paste(names(cfg$baseline_variants), collapse = "; ")`) and the whole
+  evaluation is repeated with the same curves. The spread of the results is
+  how much of them belongs to the yardstick rather than to the curves; this
+  is the stronger of the two checks.
+
 ## Readiness criteria
 
 Fixed before the results were produced (configuration `readiness`); the
@@ -284,6 +306,64 @@ if (length(tm)) {
 ```
 
 `r if (length(tm)) sprintf("Deaths follow temperature: the correlation peaks at %s.", paste(sprintf("%+d days (%s)", pk$lag, pk$period), collapse = " and ")) else ""`
+
+## Baseline audit
+
+```{r audit-load}
+ba <- tar_read(baseline_audit)
+```
+
+```{r audit-pooled}
+if (!is.null(ba))
+  kbl(ba$cool_pooled[, .(Baseline = baseline, Period = period, Season = season,
+                         `City-days x ages` = format(days, big.mark = ","),
+                         Observed = fmt(O, 0), Expected = fmt(E, 0),
+                         `Observed / expected` = sprintf("%s (%s-%s)", fmt(ratio, 3),
+                                                         fmt(lo, 3), fmt(hi, 3)))],
+      caption = "Cool reference days: observed against the deaths the baseline expects (1 = unbiased)")
+```
+
+```{r audit-city, fig.height=4.5}
+#| fig-cap: "Cool summer days, city by city, configured baseline: observed / expected with 95% interval."
+if (!is.null(ba)) {
+  a <- merge(ba$cool_days[baseline == levels(baseline)[1] & season == "Summer (Jun-Sep)"],
+             nm_city, by = "URAU_CODE")
+  ggplot(a, aes(ratio, name, colour = period)) + geom_vline(xintercept = 1, linetype = 2) +
+    geom_pointrange(aes(xmin = lo, xmax = hi), position = position_dodge(width = .5)) +
+    labs(x = "Observed / expected on cool summer days", y = NULL, colour = NULL) +
+    theme(legend.position = "bottom")
+}
+```
+
+```{r audit-sens}
+if (!is.null(ba))
+  kbl(ba$sensitivity[, .(Baseline = baseline, Curves = curves, Episodes = episodes,
+                         `Summer excess` = paste0(fmt(summer_excess_pct, 1), "%"),
+                         Observed = fmt(observed, 0), Predicted = fmt(predicted, 0),
+                         `Obs / pred` = fmt(ratio), Slope = fmt(slope),
+                         Coverage = pct(coverage_95), Events = events,
+                         POD = fmt(pod), FAR = fmt(far), HSS = fmt(hss))],
+      caption = "The whole evaluation repeated with alternative baselines (all periods, episodes)")
+```
+
+```{r audit-numbers}
+aud_txt <- ""
+if (!is.null(ba)) {
+  cs <- ba$cool_pooled[baseline == levels(baseline)[1] & season == "Summer (Jun-Sep)"]
+  ss <- ba$sensitivity[curves == SYS]
+  aud_txt <- sprintf(paste0(
+    "With the configured baseline, observed deaths on cool summer days are %s of what it ",
+    "expects (%s). Across the %d baselines the system's ratio of observed to predicted heat ",
+    "deaths ranges from %s to %s, and the number of episodes with a significant excess from ",
+    "%d to %d."),
+    paste(sprintf("%s (95%% CI %s-%s)", pct(cs$ratio, 1), pct(cs$lo, 1), pct(cs$hi, 1)),
+          collapse = " and "),
+    paste(cs$period, collapse = " and "), nrow(ss), fmt(min(ss$ratio)), fmt(max(ss$ratio)),
+    as.integer(min(ss$events)), as.integer(max(ss$events)))
+}
+```
+
+`r aud_txt`
 
 ## The rolling curves
 
@@ -397,6 +477,19 @@ if (has_roll) {
 }
 ```
 
+## Results by city
+
+```{r by-city}
+if (has_roll && !is.null(re$cities)) {
+  bc <- merge(re$cities, nm_city, by = "URAU_CODE")
+  kbl(bc[order(name, curves), .(City = name, Curves = curves, Episodes = episodes,
+                                Observed = fmt(observed, 0), Predicted = fmt(predicted, 0),
+                                `Obs / pred` = fmt(ratio), Coverage = pct(coverage_95),
+                                Hits = hits, `False alarms` = false_alarms, Misses = misses)],
+      caption = "Heatwave episodes city by city, all periods")
+}
+```
+
 ## Daily prediction band
 
 For every summer day of `r if (!is.null(rx)) rx$city else "the example city"`,
@@ -503,6 +596,8 @@ with fixed criteria. It does not cover the temperature forecast: in operation
 the system will receive forecasts 1-7 days ahead, whose errors (a warm bias
 on hot days, growing with lead time) add to the ranges above. That is the
 next validation step.
+
+`r aud_txt`
 
 **Known limitations.**
 

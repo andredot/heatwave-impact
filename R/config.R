@@ -85,15 +85,17 @@ cfg <- list(
   hw_max_gap  = 1,      # hot spells separated by <= 1 day are merged
   warm_months = 5:9,
   tail_days   = 7,      # days after the episode counted in the episode window
+  hw_merge_windows = TRUE, # episodes whose windows touch the next one are one heatwave
   post_days   = 14,     # further days used to look at mortality displacement
 
   # ---- Report 1: adaptation across Italy -----------------------------------
   # Every city refitted in consecutive, non-overlapping windows (see R/adaptation.R).
   adaptation = list(
-    windows = list(c("2011-01-01", "2013-12-31"), c("2014-01-01", "2016-12-31"),
-                   c("2017-01-01", "2019-12-31"),
-                   c("2023-01-01", NA)),    # NA = last day with data (2026 is folded in:
-                                            # half a year has no summer of its own)
+    # 5-year windows where the data allow: the years before COVID-19 give one full
+    # window and four years, the years after it three and a half (2026 has data to
+    # June, so it is folded into the last window). NA = last day with data.
+    windows = list(c("2011-01-01", "2015-12-31"), c("2016-01-01", "2019-12-31"),
+                   c("2023-01-01", NA)),
     summer_months = 6:9,       # reference summers of the standardised attributable fraction
     exclude_years = 2020:2022, # COVID-19: no reference summer, no window
     dose_pct      = 90         # heat dose = degrees above this city percentile, summed
@@ -157,6 +159,13 @@ cfg <- list(
   baseline_trend_df_per_year = 0.5,
   baseline_min_daily = 2,     # age groups with fewer deaths/day use the 20+ model x their share
   baseline_cold_offset = TRUE, # remove the published cold effect from reference days (B = deaths at MMT)
+  # alternative baselines for the audit of the system validation (overrides of
+  # the settings above); the evaluation is repeated with each
+  baseline_variants = list(
+    `Two seasonal harmonics` = list(baseline_harmonics = 2),
+    `No cold offset` = list(baseline_cold_offset = FALSE),
+    `Reference days April-October only` = list(baseline_exclude_months = c(11, 12, 1, 2, 3))
+  ),
 
   # ---- temperature forecasts (Open-Meteo Previous Runs API) ------------------
   forecast_model    = "ecmwf_ifs025",
